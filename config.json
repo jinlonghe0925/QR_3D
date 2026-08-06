@@ -1,0 +1,41 @@
+{
+    "simulate": {
+        "qr_image": "qr_template.jpg",
+        "output": "my_simulation666.png",
+        "output_size": [640, 480],
+        "qr_size": 0.9,
+        "tx": 0.23,
+        "ty": -0.16,
+        "tz": 2.25,
+        "angle_x": 30.0,
+        "angle_y": 25.0,
+        "angle_z": -10.0,
+        "fov_x": 60.0,
+        "draw_axes": false,
+        "show": false,
+        "visualize_3d": true,
+        "save_points": null,
+        "estimate_pose": true,
+        "debug": false,
+        "debug_dir": null,
+        "model_size": "s",
+        "detector": "opencv",
+        "square_size": 800,
+        "conf_threshold": 0.2,
+        "nms_threshold": 0.5
+    },
+    "estimate": {
+        "image": null,
+        "qr_size": 0.049,
+        "fov_x": 60.0,
+        "model_size": "s",
+        "detector": "opencv",
+        "square_size": 800,
+        "conf_threshold": 0.2,
+        "nms_threshold": 0.5,
+        "output": null,
+        "show": false,
+        "debug": false,
+        "debug_dir": null
+    }
+}

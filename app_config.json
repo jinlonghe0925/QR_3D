@@ -1,0 +1,108 @@
+{
+    "_说明": "AR位姿→机器狗导航 统一配置文件",
+    "_用法": "命令行参数会覆盖此文件中的对应值",
+
+    "model": {
+        "_说明": "YOLO检测模型与推理参数",
+        "model_path": "../qrdet-s.onnx",
+        "conf_threshold": 0.2,
+        "nms_threshold": 0.5
+    },
+
+    "camera": {
+        "_说明": "相机内参与物理参数",
+        "fov_x": 60.0,
+        "fov_y": 34.0,
+        "qr_size": 0.10,
+        "camera_intrinsics_path": ""
+    },
+
+    "pose_estimation": {
+        "_说明": "位姿估计管线参数",
+        "square_size": 800,
+        "margin_qr": 1500,
+        "detector_type": "opencv",
+        "warped_detect_count": 5,
+        "warped_detect_min_success": 2,
+        "dilate_kernel_size": 55,
+        "output_dir": "gimbal_pose_output"
+    },
+
+    "multi_frame": {
+        "_说明": "多帧角点平均参数",
+        "n_frames": 5,
+        "frame_interval_sec": 0.06,
+        "min_valid_frames": 2
+    },
+
+    "gimbal": {
+        "_说明": "云台控制参数",
+        "ip": "192.168.1.99",
+        "port": 6001,
+        "rtsp_path": "/ch1/stream0",
+        "auto_rotate": true,
+        "rotation_step_deg": 5.0,
+        "rotation_step_min": 1.0,
+        "rotation_step_max": 45.0,
+        "zoom_step": 1.0,
+        "zoom_min": 1.0,
+        "zoom_max": 30.0,
+        "angle_dead_zone_deg": 0.1,
+        "gimbal_stable_delay_sec": 0.5
+    },
+
+    "imaging_quality": {
+        "_说明": "成像质量评估阈值 (4个条件)",
+        "_条件1": "正对程度: |roll-180°| < align_thresh_deg",
+        "_条件2": "QR占图比: qr_fill_ratio_min ~ qr_fill_ratio_max",
+        "_条件3": "视线-平面夹角: 相机→QR向量 vs QR法线",
+        "_条件4": "成像平面-二维码平面夹角: 相机光轴 vs QR法线",
+        "align_thresh_deg": 15.0,
+        "qr_fill_ratio_min": 0.15,
+        "qr_fill_ratio_max": 0.40,
+        "view_angle_thresh_deg": 15.0,
+        "plane_angle_thresh_deg": 15.0
+    },
+
+    "lateral_judge": {
+        "_说明": "水平偏移判断",
+        "dead_zone_m": 0.02
+    },
+
+    "dog_navigator": {
+        "_说明": "机器狗导航参数",
+        "ip": "192.168.1.103",
+        "port": 43893,
+        "stop_distance_m": 0.8,
+        "sim_mode": true,
+        "auto_stand": true
+    },
+
+    "video": {
+        "_说明": "视频流显示参数",
+        "window_width": 1280,
+        "window_height": 720,
+        "angle_refresh_interval": 10,
+        "cross_len": 20,
+        "qr_circle_radius": 18
+    },
+
+    "loop": {
+        "_说明": "循环模式参数",
+        "interval_sec": 2.0
+    },
+
+    "visualizer_3d": {
+        "_说明": "3D可视化参数",
+        "fig_width": 12,
+        "fig_height": 9,
+        "viz_scale": 1.0,
+        "frustum_far_ratio": 1.2,
+        "before_color": "r",
+        "before_lw": 1.5,
+        "after_color": "b",
+        "after_lw": 3.0,
+        "elev": 25,
+        "azim": -60
+    }
+}
