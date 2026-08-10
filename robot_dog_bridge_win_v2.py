@@ -50,7 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # ── 基础模块 ──
 import qr_detection
 import pose_estimation
-import yolo_detection_ascend as yolo_detection
+from yolo_detector import YoloDetector
 
 # ── 配置模块 ──
 from config_utils import load_camera_intrinsics, load_app_config, get_config_value
@@ -68,6 +68,7 @@ from pose_pipeline import (
 )
 from gimbal_operator import GimbalOperator
 from visualizer_3d import FrustumVisualizer
+from http_video_server import HttpVideoServer
 
 # ── 云台控制 (条件导入) ──
 try:
@@ -99,11 +100,14 @@ class WinPoseEstimatorV2:
         """
         self._cfg = config  # 保存完整配置引用
 
-        # ── 模型参数 ──
+        # ── 模型参数 (由 YoloDetector 管理, 保留属性供外部查询) ──
         model_cfg = config.get("model", {})
         self.model_path = model_cfg.get("model_path", "../qrdet-s.onnx")
         self.conf_threshold = model_cfg.get("conf_threshold", 0.2)
         self.nms_threshold = model_cfg.get("nms_threshold", 0.5)
+
+        # ── 显示模式: 检测 cv2 是否有 GUI 支持, 无则用 HTTP MJPEG ──
+        self._use_http_display = not self._cv2_has_gui()
 
         # ── 相机参数 ──
         camera_cfg = config.get("camera", {})
@@ -133,6 +137,8 @@ class WinPoseEstimatorV2:
         self.video_thread = None
         self.video_running = False
         self.video_paused = False
+        self._debug_mode = False  # 由 main() 设置
+        self._yolo_lock = threading.Lock()  # 防止多线程同时调用 Ascend 推理
         self.current_frame = None
         self.frame_lock = threading.Lock()
         self.latest_result_image = None
@@ -144,6 +150,8 @@ class WinPoseEstimatorV2:
         self._angle_refresh = video_cfg.get("angle_refresh_interval", 10)
         self._cross_len = video_cfg.get("cross_len", 20)
         self._qr_circle_r = video_cfg.get("qr_circle_radius", 18)
+        self._http_disp_w = video_cfg.get("http_display_width", 960)  # HTTP 视频缩放宽度
+        self._http_jpg_q = video_cfg.get("http_jpg_quality", 50)      # JPEG 质量
 
         # ── 云台操作器 (从配置初始化) ──
         self.gimbal_op = GimbalOperator(config=config)
@@ -155,6 +163,11 @@ class WinPoseEstimatorV2:
         # ── 3D 可视化 (从配置初始化) ──
         self._viz3d = FrustumVisualizer(config=config)
         self._pending_3d_data = None
+
+        # ── HTTP 视频服务器 (板端 .om 模式) ──
+        video_cfg = config.get("video", {})
+        self._http_server: Optional[HttpVideoServer] = None
+        self._http_port = video_cfg.get("http_port", 8080)
 
         # ── 云台控制器 ──
         gimbal_cfg = config.get("gimbal", {})
@@ -170,15 +183,20 @@ class WinPoseEstimatorV2:
             self._connect_gimbal(_gimbal_ip, _gimbal_port)
         self.gimbal_op.set_gimbal(self.gimbal)
 
-        # ── YOLO 检测器 ──
-        print("[Detector] 加载 ONNX 模型: {}".format(self.model_path))
-        self.detector = yolo_detection.load_yolov8_detector(
-            model_path=self.model_path,
-            conf_threshold=self.conf_threshold,
-            nms_threshold=self.nms_threshold,
-        )
-        if self.detector is None:
-            raise RuntimeError("ONNX 检测器加载失败，请确认已安装 onnxruntime 且模型路径正确")
+        # ── YOLO 检测器 (通过 YoloDetector 封装, 自动识别 .om / .onnx 后端) ──
+        self.yolo = YoloDetector.from_config(config)
+        if not self.yolo.is_ready:
+            raise RuntimeError(f"YOLO 检测器加载失败: {self.yolo.model_path}")
+
+    @staticmethod
+    def _cv2_has_gui() -> bool:
+        """检测 cv2 是否有 GUI 支持 (namedWindow 可用)。"""
+        try:
+            cv2.namedWindow("_probe_", cv2.WINDOW_NORMAL)
+            cv2.destroyWindow("_probe_")
+            return True
+        except Exception:
+            return False
 
     def update_params_from_args(self, model_path=None, qr_size=None, fov_x=None,
                                  square_size=None, conf=None, nms=None, detector=None,
@@ -267,9 +285,10 @@ class WinPoseEstimatorV2:
 
     def _run_pose_estimation(self, image: np.ndarray, debug=False, debug_dir=None):
         """执行完整位姿估计管线 (委托给 pose_pipeline 模块)。"""
+        import yolo_detection_ascend as _yd
         success, pose_data, result_image, _extra = estimate_pose_from_image(
             image=image,
-            detector=self.detector,
+            detector=self.yolo._detector,
             qr_size=self.qr_size,
             fov_x=self.fov_x,
             square_size=self.square_size,
@@ -278,7 +297,7 @@ class WinPoseEstimatorV2:
             override_camera_matrix=self._override_camera_matrix,
             debug=debug,
             debug_dir=debug_dir,
-            yolo_detection_module=yolo_detection,
+            yolo_detection_module=_yd,
             margin_qr=self.margin_qr,
             dilate_kernel_size=self.dilate_kernel_size,
             warped_detect_count=self.warped_detect_count,
@@ -323,12 +342,25 @@ class WinPoseEstimatorV2:
         self.video_running = True
         self.video_paused = False
 
+        # ── HTTP 视频服务器 (板端无GUI模式) ──
+        if self._use_http_display:
+            self._http_server = HttpVideoServer(port=self._http_port,
+                                                 jpg_quality=self._http_jpg_q)
+            self._http_server.start()
+            # HTTP 模式: 主线程直接运行视频循环 (ACL 必须与初始化在同一线程)
+            self._video_display_loop()
+            return
+
         self.video_thread = threading.Thread(target=self._video_display_loop, daemon=True)
         self.video_thread.start()
 
         step = self.gimbal_op.rotation_step
         zoom_step = self.gimbal_op.zoom_step_val
-        print(f"\n  视频窗口已打开")
+        if self._use_http_display:
+            print(f"\n  HTTP 视频流已启动 (板端模式)")
+            print(f"  在 PC 浏览器打开控制页面操作")
+        else:
+            print(f"\n  视频窗口已打开")
         print(f"  按 'c' - 捕获当前帧并估计位姿 (刷新ROI, 自动旋转)")
         print(f"  按 'r' - 旋转云台到上次识别目标角度")
         print(f"  按 '<- ->' - Yaw 微调 (±{step:.0f}°)")
@@ -341,7 +373,153 @@ class WinPoseEstimatorV2:
         print("-" * 60)
 
     def _video_display_loop(self):
-        """视频显示主循环 (在线程中运行)。"""
+        """视频显示主循环 (在线程中运行)。
+
+        根据 _use_http_display 选择模式:
+            True  → HTTP MJPEG 流 (板端 Ascend, 无 cv2 窗口)
+            False → cv2 窗口 (PC Windows/ONNX)
+        """
+        if self._use_http_display:
+            self._video_loop_http()
+        else:
+            self._video_loop_cv2()
+
+    def _video_loop_http(self):
+        """HTTP MJPEG 模式视频循环 (板端 Ascend, 无 GUI)。"""
+        frame_count = 0
+        op = self.gimbal_op
+
+        try:
+            while self.video_running:
+                ret, frame = self.video_capture.read()
+                if not ret or frame is None:
+                    time.sleep(0.05)
+                    continue
+
+                frame_count += 1
+                display_frame = frame.copy()
+
+                with self.frame_lock:
+                    self.current_frame = frame.copy()
+
+                # 刷新云台角度
+                if self.gimbal is not None and frame_count % self._angle_refresh == 0:
+                    op.update_current_angles()
+
+                # ── 视频叠加 (与 cv2 模式相同) ──
+                h, w = display_frame.shape[:2]
+                overlay_y = 30
+                cv2.putText(display_frame,
+                            f"Gimbal Yaw: {op.current_gimbal_yaw:.1f}  Pitch: {op.current_gimbal_pitch:.1f}  Zoom: {op.current_zoom_mag:.1f}x",
+                            (10, overlay_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+                if op.target_yaw != 0.0 or op.target_pitch != 0.0:
+                    cv2.putText(display_frame,
+                                f"Target  Yaw: {op.target_yaw:.1f}  Pitch: {op.target_pitch:.1f}  [r] Rotate",
+                                (10, overlay_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+                hint_lines = [
+                    f"Step={op.rotation_step:.0f}deg  AutoRotate={'ON' if self.auto_rotate else 'OFF'}",
+                    f"Zoom +/-{op.zoom_step_val:.0f}x  [c] Detect QR  [q] Quit",
+                ]
+                for i, line in enumerate(hint_lines):
+                    cv2.putText(display_frame, line,
+                                (10, h - 30 - (len(hint_lines) - 1 - i) * 22),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+                # 图像中心 (黄色叉号) + QR 中心 (绿色圆圈)
+                img_cx, img_cy = w // 2, h // 2
+                cl = self._cross_len
+                cv2.line(display_frame, (img_cx - cl, img_cy - cl),
+                         (img_cx + cl, img_cy + cl), (0, 255, 255), 2)
+                cv2.line(display_frame, (img_cx - cl, img_cy + cl),
+                         (img_cx + cl, img_cy - cl), (0, 255, 255), 2)
+
+                if self.qr_center is not None:
+                    r = self._qr_circle_r
+                    cv2.circle(display_frame, self.qr_center, r, (0, 255, 0), 2)
+                    cv2.line(display_frame,
+                             (self.qr_center[0], self.qr_center[1] - 8),
+                             (self.qr_center[0], self.qr_center[1] + 8), (0, 255, 0), 1)
+                    cv2.line(display_frame,
+                             (self.qr_center[0] - 8, self.qr_center[1]),
+                             (self.qr_center[0] + 8, self.qr_center[1]), (0, 255, 0), 1)
+
+                # 缩小分辨率 (降低带宽)
+                if self._http_disp_w > 0 and w > self._http_disp_w:
+                    scale = self._http_disp_w / w
+                    dh = int(h * scale)
+                    display_small = cv2.resize(display_frame, (self._http_disp_w, dh))
+                else:
+                    display_small = display_frame
+
+                self._http_server.update_frame(display_small)
+
+                # ROI 结果图独立推流
+                with self.result_image_lock:
+                    if self.latest_result_image is not None:
+                        self._http_server.update_roi(self.latest_result_image)
+
+                # ── 处理 HTTP 按键 ──
+                key = self._http_server.get_pending_key()
+                if key is not None:
+                    if key == 'q':
+                        break
+                    elif key == 'c':
+                        print(f"\n[Video] 截取{self.n_frames}帧进行位姿估计...")
+                        with self.frame_lock:
+                            first_frame = self.current_frame.copy() if self.current_frame is not None else None
+                        if first_frame is not None:
+                            self._capture_and_estimate_multi(first_frame)  # 主线程调用 (ACL不支持子线程)
+                    elif key == 'r':
+                        if self.gimbal is not None:
+                            threading.Thread(target=op.rotate_to_target, daemon=True).start()
+                    elif key == 't':
+                        self.auto_rotate = not self.auto_rotate
+                        print(f"[Gimbal] 自动旋转: {'开启' if self.auto_rotate else '关闭'}")
+                    elif key == 'a':
+                        op.zoom(+op.zoom_step_val)
+                    elif key == 'd':
+                        op.zoom(-op.zoom_step_val)
+                    elif key == 'f':
+                        op.auto_focus()
+                    elif key == '+':
+                        op.adjust_rotation_step(+5.0)
+                    elif key == '-':
+                        op.adjust_rotation_step(-5.0)
+                    elif key == 'left':
+                        op.manual_adjust(dyaw=-op.rotation_step, dpitch=0)
+                    elif key == 'right':
+                        op.manual_adjust(dyaw=op.rotation_step, dpitch=0)
+                    elif key == 'up':
+                        op.manual_adjust(dyaw=0, dpitch=op.rotation_step)
+                    elif key == 'down':
+                        op.manual_adjust(dyaw=0, dpitch=-op.rotation_step)
+                    elif key == 'snap':
+                        with self.frame_lock:
+                            snap_frame = self.current_frame.copy() if self.current_frame is not None else None
+                        if snap_frame is not None:
+                            self._http_server.snap(snap_frame)
+                            print(f"[Video] 截图已推送")
+
+                # 保持帧率
+                time.sleep(0.02)
+
+        except Exception as e:
+            print(f"\n[Video] HTTP 循环异常: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self.video_running = False
+            if self._http_server is not None:
+                self._http_server.stop()
+            if self.video_capture is not None:
+                self.video_capture.release()
+                self.video_capture = None
+            print("\n视频流已停止")
+
+    def _video_loop_cv2(self):
+        """cv2 窗口模式视频循环 (PC Windows/ONNX)。"""
         window_name = "Gimbal Video Stream (Win v2)"
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window_name, self._win_w, self._win_h)
@@ -375,7 +553,6 @@ class WinPoseEstimatorV2:
                 with self.frame_lock:
                     self.current_frame = frame.copy()
 
-                # 刷新云台角度
                 if self.gimbal is not None and frame_count % self._angle_refresh == 0:
                     op.update_current_angles()
 
@@ -401,7 +578,6 @@ class WinPoseEstimatorV2:
                                 (10, h - 30 - (len(hint_lines) - 1 - i) * 22),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
-                # 图像中心 (黄色叉号) + QR 中心 (绿色圆圈)
                 img_cx, img_cy = w // 2, h // 2
                 cl = self._cross_len
                 cv2.line(display_frame, (img_cx - cl, img_cy - cl),
@@ -421,18 +597,15 @@ class WinPoseEstimatorV2:
 
                 cv2.imshow(window_name, display_frame)
 
-                # 3D 可视化 (主线程非阻塞: 只在无3D窗口时处理按键)
                 if self._pending_3d_data is not None:
                     pdata_before, pdata_after, pfov, pw, ph = self._pending_3d_data
                     self._pending_3d_data = None
                     self._viz3d.show_nonblocking(pdata_before, pdata_after, pfov, pw, ph)
 
-                # ROI 窗口
                 with self.result_image_lock:
                     if self.latest_result_image is not None:
                         cv2.imshow(result_window_name, self.latest_result_image)
 
-                # ── 键盘处理 (仅在没有3D窗口时响应, 避免matplotlib拦截按键) ──
                 try:
                     import matplotlib.pyplot as _plt
                     _has_3d = self._viz3d.fig is not None and _plt.fignum_exists(self._viz3d.fig.number)
@@ -440,12 +613,10 @@ class WinPoseEstimatorV2:
                     _has_3d = False
 
                 if _has_3d:
-                    # 3D窗口存在: 仅响应 'q' 退出和关闭窗口
                     key_raw = cv2.waitKeyEx(1)
                     key = key_raw & 0xFF
                     if key == ord('q'):
                         break
-                    # 用 plt.pause 保持3D窗口响应
                     _plt.pause(0.05)
                 else:
                     key_raw = cv2.waitKeyEx(1)
@@ -458,18 +629,10 @@ class WinPoseEstimatorV2:
                         with self.frame_lock:
                             first_frame = self.current_frame.copy() if self.current_frame is not None else None
                         if first_frame is not None:
-                            threading.Thread(
-                                target=self._capture_and_estimate_multi,
-                                args=(first_frame,),
-                                daemon=True
-                            ).start()
-                        else:
-                            print(f"  ✗ 当前帧为空，取消")
+                            self._capture_and_estimate_multi(first_frame)  # 主线程调用 (ACL不支持子线程)
                     elif key == ord('r'):
                         if self.gimbal is not None:
                             threading.Thread(target=op.rotate_to_target, daemon=True).start()
-                        else:
-                            print("[Gimbal] 云台未连接，无法旋转")
                     elif key == ord('t'):
                         self.auto_rotate = not self.auto_rotate
                         print(f"[Gimbal] 自动旋转: {'开启' if self.auto_rotate else '关闭'}")
@@ -483,13 +646,13 @@ class WinPoseEstimatorV2:
                         op.adjust_rotation_step(+5.0)
                     elif key == ord('-') or key == ord('_'):
                         op.adjust_rotation_step(-5.0)
-                    elif key_raw == 2424832:  # 左箭头
+                    elif key_raw == 2424832:
                         op.manual_adjust(dyaw=-op.rotation_step, dpitch=0)
-                    elif key_raw == 2555904:  # 右箭头
+                    elif key_raw == 2555904:
                         op.manual_adjust(dyaw=op.rotation_step, dpitch=0)
-                    elif key_raw == 2490368:  # 上箭头
+                    elif key_raw == 2490368:
                         op.manual_adjust(dyaw=0, dpitch=op.rotation_step)
-                    elif key_raw == 2621440:  # 下箭头
+                    elif key_raw == 2621440:
                         op.manual_adjust(dyaw=0, dpitch=-op.rotation_step)
 
         except Exception as e:
@@ -501,8 +664,11 @@ class WinPoseEstimatorV2:
             if self.video_capture is not None:
                 self.video_capture.release()
                 self.video_capture = None
-            cv2.destroyWindow(window_name)
-            cv2.destroyWindow(result_window_name)
+            try:
+                cv2.destroyWindow(window_name)
+                cv2.destroyWindow(result_window_name)
+            except Exception:
+                pass
             print("\n视频流已停止")
 
     def _capture_and_estimate_multi(self, first_frame):
@@ -510,6 +676,17 @@ class WinPoseEstimatorV2:
 
         第1帧完整 YOLO+透视矫正，后续帧复用 H_mat 做快速检测。
         """
+        # 防重入: 如果上一轮还没处理完，跳过
+        if not self._yolo_lock.acquire(blocking=False):
+            print("[Video] 上一轮位姿估计尚未完成，跳过")
+            return
+        time.sleep(0.5)  # 等 NPU 资源完全释放
+        try:
+            self._capture_and_estimate_multi_impl(first_frame)
+        finally:
+            self._yolo_lock.release()
+
+    def _capture_and_estimate_multi_impl(self, first_frame):
         all_points = []
         first_pose_data = None
         H_mat = None
@@ -531,26 +708,52 @@ class WinPoseEstimatorV2:
                 if frame_i is None:
                     print(f"    ✗ 帧 {i+1} 获取失败，跳过")
                     continue
-            temp_path = os.path.join(self.output_dir, f"video_capture_{i}.jpg")
-            cv2.imwrite(temp_path, frame_i)
+            if self._debug_mode:
+                temp_path = os.path.join(self.output_dir, f"video_capture_{i}.jpg")
+                cv2.imwrite(temp_path, frame_i)
 
             if i == 0:
-                success, pose_data, result_img, extra = estimate_pose_from_image(
-                    image=frame_i,
-                    detector=self.detector,
-                    qr_size=self.qr_size,
-                    fov_x=self.fov_x,
-                    square_size=self.square_size,
-                    detector_type=self.detector_type,
-                    output_dir=self.output_dir,
-                    override_camera_matrix=self._override_camera_matrix,
-                    debug=False,
-                    yolo_detection_module=yolo_detection,
-                    margin_qr=self.margin_qr,
-                    dilate_kernel_size=self.dilate_kernel_size,
-                    warped_detect_count=self.warped_detect_count,
-                    warped_detect_min_success=self.warped_detect_min_success,
-                )
+                import yolo_detection_ascend as _yd2
+                # 第1帧重试最多3次 (RTSP花帧容错)
+                success = False
+                for retry in range(3):
+                    if retry > 0:
+                        time.sleep(0.15)
+                        with self.frame_lock:
+                            frame_i = self.current_frame.copy() if self.current_frame is not None else None
+                        if frame_i is None:
+                            continue
+                        # 保存重试帧截图 (仅 debug 模式)
+                        if self._debug_mode:
+                            retry_path = os.path.join(self.output_dir, f"yolo_retry_{retry}_{int(time.time())}.jpg")
+                            cv2.imwrite(retry_path, frame_i)
+                    try:
+                        success, pose_data, result_img, extra = estimate_pose_from_image(
+                            image=frame_i,
+                            detector=self.yolo._detector,
+                            qr_size=self.qr_size,
+                            fov_x=self.fov_x,
+                            square_size=self.square_size,
+                            detector_type=self.detector_type,
+                            output_dir=self.output_dir,
+                            override_camera_matrix=self._override_camera_matrix,
+                            debug=False,
+                            yolo_detection_module=_yd2,
+                            margin_qr=self.margin_qr,
+                            dilate_kernel_size=self.dilate_kernel_size,
+                            warped_detect_count=self.warped_detect_count,
+                            warped_detect_min_success=self.warped_detect_min_success,
+                        )
+                    except RuntimeError as e:
+                        if "ACL failed" in str(e):
+                            print(f"    帧 1 (重试{retry+1}): ACL错误，跳过本轮")
+                            break  # 跳出重试循环，不再继续
+                        else:
+                            raise
+                    if success:
+                        break
+                    print(f"    帧 1 (重试{retry+1}): 未检测到QR，换帧重试...")
+
                 if success and pose_data is not None:
                     H_mat = extra.get("H_mat")
                     warped_size = extra.get("warped_size")
@@ -565,7 +768,7 @@ class WinPoseEstimatorV2:
                     else:
                         print(f"    帧 1: ✓ 位姿OK，但无角点")
                 else:
-                    print(f"    帧 1: ✗ 检测失败")
+                    print(f"    帧 1: ✗ 检测失败 (重试3次)")
             else:
                 if H_mat is not None and alpha_mask_big is not None and quad_points is not None:
                     pts = fast_detect_points(
@@ -721,7 +924,16 @@ class WinPoseEstimatorV2:
 
         # ── 3D 可视化 (红色=旋转前, 蓝色=旋转后) ──
         print(f"\n【3D可视化】已准备数据 (红色=旋转前, 蓝色=旋转后)")
-        self._pending_3d_data = (pose_data, aligned_pose, fov_x_actual, w, h)
+        if self._use_http_display and self._http_server is not None:
+            # 板端: 生成 Plotly HTML 并推送到 HTTP
+            try:
+                html_3d = self._viz3d.render_html(pose_data, aligned_pose, fov_x_actual, w, h)
+                self._http_server.set_3d_html(html_3d)
+            except Exception as e:
+                print(f"  ✗ 3D HTML 生成失败: {e}")
+        else:
+            # PC 端: matplotlib 窗口
+            self._pending_3d_data = (pose_data, aligned_pose, fov_x_actual, w, h)
 
         print(f"\n✓ 位姿估计完成 ({len(all_points)}/{self.n_frames} 帧有效)，ROI 已刷新")
 
@@ -733,6 +945,10 @@ class WinPoseEstimatorV2:
         print("\n停止视频流...")
         self.video_running = False
 
+        if self._http_server is not None:
+            self._http_server.stop()
+            self._http_server = None
+
         if self.video_thread is not None:
             self.video_thread.join(timeout=2.0)
             self.video_thread = None
@@ -741,7 +957,10 @@ class WinPoseEstimatorV2:
             self.video_capture.release()
             self.video_capture = None
 
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
         print("  ✓ 视频流已停止")
 
 
@@ -792,10 +1011,13 @@ def pipeline(estimator: WinPoseEstimatorV2,
     print_pose_info(pose, gimbal=estimator.gimbal)
 
     if show and result_img is not None:
-        cv2.imshow("QR Pose Result (Windows)", result_img)
-        print("[Pipeline] 按任意键关闭窗口...")
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
+        try:
+            cv2.imshow("QR Pose Result (Windows)", result_img)
+            print("[Pipeline] 按任意键关闭窗口...")
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
 
     return navigator.go_to_from_pose(pose)
 
@@ -860,7 +1082,7 @@ def main():
             config.setdefault("camera", {})["qr_size"] = float(intrinsics["qr_size"])
         cam_mat = intrinsics.get("camera_matrix", None)
 
-    # ── 3) 命令行参数覆盖配置文件 ──
+    # ── 3) 命令行参数覆盖配置文件 (直接赋值覆盖, 不用 setdefault) ──
     if args.fov_x is not None:
         config.setdefault("camera", {})["fov_x"] = args.fov_x
     if args.qr_size is not None:
@@ -872,13 +1094,17 @@ def main():
     if args.nms is not None:
         config.setdefault("model", {})["nms_threshold"] = args.nms
     if args.square_size is not None:
-        config.setdefault("pose_estimation", {})["square_size"] = args.square_size
+        config["pose_estimation"] = config.get("pose_estimation", {})
+        config["pose_estimation"]["square_size"] = args.square_size
     if args.detector is not None:
-        config.setdefault("pose_estimation", {})["detector_type"] = args.detector
+        config["pose_estimation"] = config.get("pose_estimation", {})
+        config["pose_estimation"]["detector_type"] = args.detector
     if args.stop_distance is not None:
-        config.setdefault("dog_navigator", {})["stop_distance_m"] = args.stop_distance
+        config["dog_navigator"] = config.get("dog_navigator", {})
+        config["dog_navigator"]["stop_distance_m"] = args.stop_distance
     if args.interval is not None:
-        config.setdefault("loop", {})["interval_sec"] = args.interval
+        config["loop"] = config.get("loop", {})
+        config["loop"]["interval_sec"] = args.interval
 
     # 检查输入源
     if args.image is None and args.gimbal_ip is None and config.get("gimbal", {}).get("ip") is None:
@@ -894,6 +1120,7 @@ def main():
         gimbal_ip=args.gimbal_ip,
         gimbal_port=args.gimbal_port,
     )
+    estimator._debug_mode = args.debug
 
     # ── 5) 初始化机器狗导航 ──
     navigator = RobotDogNavigator(config=config)
@@ -913,11 +1140,13 @@ def main():
             print("按 'q' 退出")
             print("=" * 55)
             estimator.start_video_stream()
-            try:
-                while estimator.video_running:
-                    time.sleep(0.2)
-            except KeyboardInterrupt:
-                print("\n用户中断")
+            # HTTP 模式下 start_video_stream 会阻塞直到退出
+            if not estimator._use_http_display:
+                try:
+                    while estimator.video_running:
+                        time.sleep(0.2)
+                except KeyboardInterrupt:
+                    print("\n用户中断")
         elif args.mode == "loop":
             if args.image:
                 print(f"\n[Loop] 图片固定: {args.image}，每 {loop_interval}s 一轮\n")

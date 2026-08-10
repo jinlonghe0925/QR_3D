@@ -91,8 +91,10 @@ def estimate_pose_from_image(image: np.ndarray, detector,
     # ================================================================
     # 2.1 YOLOv8 检测二维码
     # ================================================================
-    print(f"\n  2.1 YOLOv8检测二维码...")
-    detections = yolo_detection_module.detect_qr_yolov8(image, detector)
+    print(f"\n  2.1 YOLOv8检测二维码... (detector={type(detector).__name__}, size={image.shape})")
+    # 确保 contiguous (RTSP 帧可能 stride 不对齐)
+    image_contig = np.ascontiguousarray(image)
+    detections = yolo_detection_module.detect_qr_yolov8(image_contig, detector)
     print(f"  检测到 {len(detections)} 个二维码")
 
     if len(detections) == 0:

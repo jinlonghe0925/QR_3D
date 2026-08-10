@@ -4,9 +4,12 @@
 
     "model": {
         "_说明": "YOLO检测模型与推理参数",
-        "model_path": "../qrdet-s.onnx",
+        "model_path": "models/qr_yolov8.om",
         "conf_threshold": 0.2,
-        "nms_threshold": 0.5
+        "nms_threshold": 0.5,
+        "device_id": 0,
+        "input_size": [640, 640],
+        "input_dtype": "float32"
     },
 
     "camera": {
@@ -80,6 +83,10 @@
 
     "video": {
         "_说明": "视频流显示参数",
+        "_显示模式": "板端自动HTTP MJPEG, PC用cv2窗口",
+        "http_port": 8080,
+        "http_display_width": 400,
+        "http_jpg_quality": 40,
         "window_width": 1280,
         "window_height": 720,
         "angle_refresh_interval": 10,
@@ -98,9 +105,9 @@
         "fig_height": 9,
         "viz_scale": 1.0,
         "frustum_far_ratio": 1.2,
-        "before_color": "r",
+        "before_color": "red",
         "before_lw": 1.5,
-        "after_color": "b",
+        "after_color": "blue",
         "after_lw": 3.0,
         "elev": 25,
         "azim": -60

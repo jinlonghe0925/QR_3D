@@ -313,7 +313,7 @@ class OnnxYoloQRDetector:
     def _preprocess(
         self, image: np.ndarray, is_bgr: bool = True
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
-        working = image.copy()
+        working = np.ascontiguousarray(image)  # 确保内存连续 (多线程安全)
         if self.apply_binary_preprocess:
             gray = cv2.cvtColor(working, cv2.COLOR_BGR2GRAY if is_bgr else cv2.COLOR_RGB2GRAY)
             binary = cv2.adaptiveThreshold(
@@ -595,7 +595,7 @@ class AscendYoloQRDetector:
     def _preprocess(
         self, image: np.ndarray, is_bgr: bool = True
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
-        working = image.copy()
+        working = np.ascontiguousarray(image)  # 确保内存连续 (多线程安全)
         if self.apply_binary_preprocess:
             gray = cv2.cvtColor(working, cv2.COLOR_BGR2GRAY if is_bgr else cv2.COLOR_RGB2GRAY)
             binary = cv2.adaptiveThreshold(
