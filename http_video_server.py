@@ -45,22 +45,25 @@ class _FrameBuffer:
         self._lock = threading.Lock()
         self._video_jpg = b""
         self._roi_jpg = b""
-        self._snap_jpg = b""  # 截图快照
+        self._snap_jpg = b""
+        self._video_cond = threading.Condition(self._lock)
+        self._roi_cond = threading.Condition(self._lock)
 
     def update_video(self, frame_bgr: np.ndarray, quality: int = 70):
         _, jpg = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
-        with self._lock:
+        with self._video_cond:
             self._video_jpg = jpg.tobytes()
+            self._video_cond.notify_all()
 
     def update_roi(self, frame_bgr: np.ndarray, quality: int = 85):
         if frame_bgr is None:
             return
         _, jpg = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
-        with self._lock:
+        with self._roi_cond:
             self._roi_jpg = jpg.tobytes()
+            self._roi_cond.notify_all()
 
     def snap(self, frame_bgr: np.ndarray, quality: int = 90):
-        """保存高分辨率截图"""
         _, jpg = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
         with self._lock:
             self._snap_jpg = jpg.tobytes()
@@ -68,6 +71,17 @@ class _FrameBuffer:
     def get_video(self) -> bytes:
         with self._lock:
             return self._video_jpg
+
+    def wait_video(self, timeout: float = 0.5) -> bytes:
+        """等待新视频帧 (条件变量，零 CPU 空转)"""
+        with self._video_cond:
+            self._video_cond.wait(timeout)
+            return self._video_jpg
+
+    def wait_roi(self, timeout: float = 0.5) -> bytes:
+        with self._roi_cond:
+            self._roi_cond.wait(timeout)
+            return self._roi_jpg
 
     def get_roi(self) -> bytes:
         with self._lock:
@@ -126,8 +140,8 @@ _HTML_PAGE = """<!DOCTYPE html>
 <div class="status" id="status"></div>
 <script>
   function send(k){fetch('/cmd?key='+k).then(r=>r.text()).then(t=>{document.getElementById('status').innerText=t})}
-  setInterval(()=>{document.getElementById('video').src='/video?'+Date.now()},500)
-  setInterval(()=>{document.getElementById('roi').src='/roi?'+Date.now()},800)
+  setInterval(()=>{document.getElementById('video').src='/video?'+Date.now()},1000)
+  setInterval(()=>{document.getElementById('roi').src='/roi?'+Date.now()},1500)
   function snap(){
     var s=document.getElementById('snap');
     s.src='/snap?'+Date.now();s.style.display='block';
@@ -153,9 +167,9 @@ class _VideoHandler(BaseHTTPRequestHandler):
         if path == "/":
             self._serve_html()
         elif path == "/video":
-            self._serve_mjpeg(self.frame_buf.get_video)
+            self._serve_mjpeg(self.frame_buf.wait_video)
         elif path == "/roi":
-            self._serve_mjpeg(self.frame_buf.get_roi)
+            self._serve_mjpeg(self.frame_buf.wait_roi)
         elif path == "/snap":
             self._serve_single(self.frame_buf.get_snap)
         elif path == "/3d":
@@ -173,9 +187,11 @@ class _VideoHandler(BaseHTTPRequestHandler):
         self.wfile.write(_HTML_PAGE.encode("utf-8"))
 
     def _serve_mjpeg(self, getter):
-        """MJPEG 流: 持续发送帧"""
+        """MJPEG 流: 持续发送帧 (无新帧时保持连接)"""
         self.send_response(200)
         self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
         self.end_headers()
         try:
             while True:
@@ -185,8 +201,9 @@ class _VideoHandler(BaseHTTPRequestHandler):
                     self.wfile.write(b"Content-Type: image/jpeg\r\n\r\n")
                     self.wfile.write(jpg)
                     self.wfile.write(b"\r\n")
-                time.sleep(0.05)
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    self.wfile.flush()
+                time.sleep(0.1)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
             pass
 
     def _serve_single(self, getter):

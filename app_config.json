@@ -69,7 +69,8 @@
 
     "lateral_judge": {
         "_说明": "水平偏移判断",
-        "dead_zone_m": 0.02
+        "lat_safe_zone_m": 0.0002,
+        "dead_zone_m": 0.00002
     },
 
     "dog_navigator": {
@@ -77,6 +78,8 @@
         "ip": "192.168.1.103",
         "port": 43893,
         "stop_distance_m": 0.8,
+        "lateral_step_m": 0.1,
+        "forward_step_m": 0.2,
         "sim_mode": true,
         "auto_stand": true
     },
@@ -85,8 +88,8 @@
         "_说明": "视频流显示参数",
         "_显示模式": "板端自动HTTP MJPEG, PC用cv2窗口",
         "http_port": 8080,
-        "http_display_width": 400,
-        "http_jpg_quality": 40,
+        "http_display_width": 320,
+        "http_jpg_quality": 35,
         "window_width": 1280,
         "window_height": 720,
         "angle_refresh_interval": 10,

@@ -173,6 +173,18 @@ class WinPoseEstimatorV2:
         gimbal_cfg = config.get("gimbal", {})
         self.gimbal = None
         self.rtsp_tv = None
+
+        # ── 机器狗 (尝试连接) ──
+        self._dog = None
+        try:
+            from robot_interface import Dog
+            dog_cfg = config.get("dog_navigator", {})
+            _dog_ip = dog_cfg.get("ip", "192.168.1.103")
+            self._dog = Dog(ip=_dog_ip)
+            self._dog.init()
+            print(f"[Dog] 机器狗已连接: {_dog_ip}")
+        except Exception as e:
+            print(f"[Dog] 机器狗连接失败 (将仅输出建议): {e}")
         # 命令行参数优先
         _gimbal_ip = gimbal_ip if gimbal_ip else gimbal_cfg.get("ip")
         _gimbal_port = gimbal_port if gimbal_port else gimbal_cfg.get("port", 6001)
@@ -183,10 +195,9 @@ class WinPoseEstimatorV2:
             self._connect_gimbal(_gimbal_ip, _gimbal_port)
         self.gimbal_op.set_gimbal(self.gimbal)
 
-        # ── YOLO 检测器 (通过 YoloDetector 封装, 自动识别 .om / .onnx 后端) ──
-        self.yolo = YoloDetector.from_config(config)
-        if not self.yolo.is_ready:
-            raise RuntimeError(f"YOLO 检测器加载失败: {self.yolo.model_path}")
+        # ── YOLO 检测器 (延迟到视频线程中初始化, ACL 需要与推理同线程) ──
+        self._yolo_config = config
+        self.yolo = None
 
     @staticmethod
     def _cv2_has_gui() -> bool:
@@ -347,20 +358,25 @@ class WinPoseEstimatorV2:
             self._http_server = HttpVideoServer(port=self._http_port,
                                                  jpg_quality=self._http_jpg_q)
             self._http_server.start()
-            # HTTP 模式: 主线程直接运行视频循环 (ACL 必须与初始化在同一线程)
-            self._video_display_loop()
+            # 帧读取线程: 持续读 RTSP → 更新 current_frame + MJPEG 推流
+            self.video_thread = threading.Thread(target=self._frame_read_loop, daemon=True)
+            self.video_thread.start()
+            # 主线程: 初始化 ACL + 处理按键 + 位姿估计
+            self.yolo = YoloDetector.from_config(self._yolo_config)
+            if not self.yolo.is_ready:
+                raise RuntimeError("YOLO 加载失败")
+            self._video_control_loop()
             return
 
+        # PC 模式
+        if self.yolo is None:
+            self.yolo = YoloDetector.from_config(self._yolo_config)
         self.video_thread = threading.Thread(target=self._video_display_loop, daemon=True)
         self.video_thread.start()
 
         step = self.gimbal_op.rotation_step
         zoom_step = self.gimbal_op.zoom_step_val
-        if self._use_http_display:
-            print(f"\n  HTTP 视频流已启动 (板端模式)")
-            print(f"  在 PC 浏览器打开控制页面操作")
-        else:
-            print(f"\n  视频窗口已打开")
+        print(f"\n  视频窗口已打开")
         print(f"  按 'c' - 捕获当前帧并估计位姿 (刷新ROI, 自动旋转)")
         print(f"  按 'r' - 旋转云台到上次识别目标角度")
         print(f"  按 '<- ->' - Yaw 微调 (±{step:.0f}°)")
@@ -371,6 +387,113 @@ class WinPoseEstimatorV2:
         print(f"  按 't' - 切换自动旋转 ({'ON' if self.auto_rotate else 'OFF'})")
         print(f"  按 'q' - 退出视频")
         print("-" * 60)
+
+
+
+    def _frame_read_loop(self):
+        """子线程: 持续读取 RTSP 帧 → 更新 current_frame + MJPEG 推流。"""
+        frame_count = 0
+        op = self.gimbal_op
+        try:
+            while self.video_running:
+                ret, frame = self.video_capture.read()
+                if not ret or frame is None:
+                    time.sleep(0.05)
+                    continue
+                frame_count += 1
+                display_frame = frame.copy()
+                with self.frame_lock:
+                    self.current_frame = frame.copy()
+
+                if self.gimbal is not None and frame_count % self._angle_refresh == 0:
+                    op.update_current_angles()
+
+                # 视频叠加
+                h, w = display_frame.shape[:2]
+                cv2.putText(display_frame,
+                            f"Yaw:{op.current_gimbal_yaw:.1f} P:{op.current_gimbal_pitch:.1f} Z:{op.current_zoom_mag:.1f}x",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                img_cx, img_cy = w // 2, h // 2
+                cl = self._cross_len
+                cv2.line(display_frame, (img_cx - cl, img_cy), (img_cx + cl, img_cy), (0, 255, 255), 1)
+                cv2.line(display_frame, (img_cx, img_cy - cl), (img_cx, img_cy + cl), (0, 255, 255), 1)
+                if self.qr_center is not None:
+                    cv2.circle(display_frame, self.qr_center, self._qr_circle_r, (0, 255, 0), 1)
+
+                # 缩放推流
+                if self._http_disp_w > 0 and w > self._http_disp_w:
+                    scale = self._http_disp_w / w
+                    display_small = cv2.resize(display_frame, (self._http_disp_w, int(h * scale)))
+                else:
+                    display_small = display_frame
+                self._http_server.update_frame(display_small)
+
+                with self.result_image_lock:
+                    if self.latest_result_image is not None:
+                        self._http_server.update_roi(self.latest_result_image)
+        except Exception as e:
+            print(f"\n[Frame] 读帧异常: {e}")
+        finally:
+            self.video_running = False
+
+    def _video_control_loop(self):
+        """主线程: 处理按键 + 位姿估计 (ACL 同线程, 不阻塞帧读取)。"""
+        op = self.gimbal_op
+        print(f"\n  HTTP 视频流已启动 (板端模式)")
+        print(f"  在 PC 浏览器打开控制页面操作")
+        print(f"  按 'c' - 检测 QR | 'r' - 旋转 | 'a/d' - 变倍 | 'f' - 对焦 | 方向键 - 微调 | 'q' - 退出")
+        print("-" * 60)
+
+        try:
+            while self.video_running:
+                key = self._http_server.get_pending_key()
+                if key is None:
+                    time.sleep(0.05)
+                    continue
+
+                if key == 'q':
+                    break
+                elif key == 'c':
+                    print(f"\n[Video] 截取{self.n_frames}帧进行位姿估计...")
+                    with self.frame_lock:
+                        first_frame = self.current_frame.copy() if self.current_frame is not None else None
+                    if first_frame is not None:
+                        self._capture_and_estimate_multi(first_frame)
+                elif key == 'r':
+                    if self.gimbal is not None:
+                        op.rotate_to_target()
+                elif key == 't':
+                    self.auto_rotate = not self.auto_rotate
+                    print(f"[Gimbal] 自动旋转: {'ON' if self.auto_rotate else 'OFF'}")
+                elif key == 'a':
+                    op.zoom(+op.zoom_step_val)
+                elif key == 'd':
+                    op.zoom(-op.zoom_step_val)
+                elif key == 'f':
+                    op.auto_focus()
+                elif key == '+':
+                    op.adjust_rotation_step(+5.0)
+                elif key == '-':
+                    op.adjust_rotation_step(-5.0)
+                elif key == 'left':
+                    op.manual_adjust(dyaw=-op.rotation_step, dpitch=0)
+                elif key == 'right':
+                    op.manual_adjust(dyaw=op.rotation_step, dpitch=0)
+                elif key == 'up':
+                    op.manual_adjust(dyaw=0, dpitch=op.rotation_step)
+                elif key == 'down':
+                    op.manual_adjust(dyaw=0, dpitch=-op.rotation_step)
+                elif key == 'snap':
+                    with self.frame_lock:
+                        sf = self.current_frame.copy() if self.current_frame is not None else None
+                    if sf is not None:
+                        self._http_server.snap(sf)
+                        print("[Video] 截图已推送")
+
+        except KeyboardInterrupt:
+            print("\n用户中断")
+        finally:
+            self.video_running = False
 
     def _video_display_loop(self):
         """视频显示主循环 (在线程中运行)。
@@ -386,6 +509,12 @@ class WinPoseEstimatorV2:
 
     def _video_loop_http(self):
         """HTTP MJPEG 模式视频循环 (板端 Ascend, 无 GUI)。"""
+        # 在线程内初始化 YOLO (ACL 与推理同线程)
+        if self.yolo is None:
+            self.yolo = YoloDetector.from_config(self._yolo_config)
+            if not self.yolo.is_ready:
+                print("[ERROR] YOLO 加载失败")
+                return
         frame_count = 0
         op = self.gimbal_op
 
@@ -393,14 +522,21 @@ class WinPoseEstimatorV2:
             while self.video_running:
                 ret, frame = self.video_capture.read()
                 if not ret or frame is None:
-                    time.sleep(0.05)
+                    # RTSP 断流重连
+                    time.sleep(0.1)
+                    if self.video_capture is not None:
+                        self.video_capture.release()
+                    self.video_capture = cv2.VideoCapture(self.rtsp_tv, cv2.CAP_FFMPEG)
+                    self.video_capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    time.sleep(0.5)
                     continue
 
                 frame_count += 1
-                display_frame = frame.copy()
-
+                # 一次 copy 同时用于显示和 current_frame
+                frame_copy = frame.copy()
+                display_frame = frame_copy
                 with self.frame_lock:
-                    self.current_frame = frame.copy()
+                    self.current_frame = frame_copy  # 同一份引用，标注叠加在 display_frame 上不影响原始
 
                 # 刷新云台角度
                 if self.gimbal is not None and frame_count % self._angle_refresh == 0:
@@ -470,7 +606,7 @@ class WinPoseEstimatorV2:
                         with self.frame_lock:
                             first_frame = self.current_frame.copy() if self.current_frame is not None else None
                         if first_frame is not None:
-                            self._capture_and_estimate_multi(first_frame)  # 主线程调用 (ACL不支持子线程)
+                            self._capture_and_estimate_multi(first_frame)  # 异步, 不阻塞
                     elif key == 'r':
                         if self.gimbal is not None:
                             threading.Thread(target=op.rotate_to_target, daemon=True).start()
@@ -502,8 +638,7 @@ class WinPoseEstimatorV2:
                             self._http_server.snap(snap_frame)
                             print(f"[Video] 截图已推送")
 
-                # 保持帧率
-                time.sleep(0.02)
+                # 不主动 sleep: RTSP read() 和 JPEG 编码自然控制帧率
 
         except Exception as e:
             print(f"\n[Video] HTTP 循环异常: {e}")
@@ -544,14 +679,20 @@ class WinPoseEstimatorV2:
 
                 ret, frame = self.video_capture.read()
                 if not ret or frame is None:
-                    time.sleep(0.05)
+                    time.sleep(0.1)
+                    if self.video_capture is not None:
+                        self.video_capture.release()
+                    self.video_capture = cv2.VideoCapture(self.rtsp_tv, cv2.CAP_FFMPEG)
+                    self.video_capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    time.sleep(0.5)
                     continue
 
                 frame_count += 1
-                display_frame = frame.copy()
-
+                # 一次 copy 同时用于显示和 current_frame
+                frame_copy = frame.copy()
+                display_frame = frame_copy
                 with self.frame_lock:
-                    self.current_frame = frame.copy()
+                    self.current_frame = frame_copy  # 同一份引用，标注叠加在 display_frame 上不影响原始
 
                 if self.gimbal is not None and frame_count % self._angle_refresh == 0:
                     op.update_current_angles()
@@ -617,7 +758,7 @@ class WinPoseEstimatorV2:
                     key = key_raw & 0xFF
                     if key == ord('q'):
                         break
-                    _plt.pause(0.05)
+                    _plt.pause(0.01)  # 降低 3D 窗口刷新开销
                 else:
                     key_raw = cv2.waitKeyEx(1)
                     key = key_raw & 0xFF
@@ -629,7 +770,7 @@ class WinPoseEstimatorV2:
                         with self.frame_lock:
                             first_frame = self.current_frame.copy() if self.current_frame is not None else None
                         if first_frame is not None:
-                            self._capture_and_estimate_multi(first_frame)  # 主线程调用 (ACL不支持子线程)
+                            self._capture_and_estimate_multi(first_frame)  # 异步
                     elif key == ord('r'):
                         if self.gimbal is not None:
                             threading.Thread(target=op.rotate_to_target, daemon=True).start()
@@ -674,13 +815,15 @@ class WinPoseEstimatorV2:
     def _capture_and_estimate_multi(self, first_frame):
         """多帧角点平均 → 位姿估计 → 计算云台目标角度。
 
-        第1帧完整 YOLO+透视矫正，后续帧复用 H_mat 做快速检测。
+
+
+
+
+        与视频循环同线程同步执行 (ACL 同线程, MJPEG 服务器独立线程推送旧帧)。
         """
-        # 防重入: 如果上一轮还没处理完，跳过
         if not self._yolo_lock.acquire(blocking=False):
             print("[Video] 上一轮位姿估计尚未完成，跳过")
             return
-        time.sleep(0.5)  # 等 NPU 资源完全释放
         try:
             self._capture_and_estimate_multi_impl(first_frame)
         finally:
@@ -714,19 +857,11 @@ class WinPoseEstimatorV2:
 
             if i == 0:
                 import yolo_detection_ascend as _yd2
-                # 第1帧重试最多3次 (RTSP花帧容错)
+                # 第1帧重试最多2次 (ACL偶发失败容错, 用同一帧)
                 success = False
-                for retry in range(3):
+                for retry in range(2):
                     if retry > 0:
-                        time.sleep(0.15)
-                        with self.frame_lock:
-                            frame_i = self.current_frame.copy() if self.current_frame is not None else None
-                        if frame_i is None:
-                            continue
-                        # 保存重试帧截图 (仅 debug 模式)
-                        if self._debug_mode:
-                            retry_path = os.path.join(self.output_dir, f"yolo_retry_{retry}_{int(time.time())}.jpg")
-                            cv2.imwrite(retry_path, frame_i)
+                        time.sleep(0.3)
                     try:
                         success, pose_data, result_img, extra = estimate_pose_from_image(
                             image=frame_i,
@@ -752,7 +887,7 @@ class WinPoseEstimatorV2:
                             raise
                     if success:
                         break
-                    print(f"    帧 1 (重试{retry+1}): 未检测到QR，换帧重试...")
+                    print(f"    帧 1 (重试{retry+1}): ACL成功但未检测到QR")
 
                 if success and pose_data is not None:
                     H_mat = extra.get("H_mat")
@@ -768,7 +903,7 @@ class WinPoseEstimatorV2:
                     else:
                         print(f"    帧 1: ✓ 位姿OK，但无角点")
                 else:
-                    print(f"    帧 1: ✗ 检测失败 (重试3次)")
+                    print(f"    帧 1: ✗ 检测失败 (ACL/未检测到QR)")
             else:
                 if H_mat is not None and alpha_mask_big is not None and quad_points is not None:
                     pts = fast_detect_points(
@@ -846,13 +981,13 @@ class WinPoseEstimatorV2:
 
         print_pose_info(pose_data, gimbal=self.gimbal)
 
-        # 画结果图
-        result_image = cv2.imread(os.path.join(self.output_dir, "video_capture_0.jpg"))
+        # 画结果图 (用内存中的 first_frame, 避免磁盘 I/O)
+        result_image = first_frame.copy()
         if result_image is not None:
             result_image = qr_detection.draw_qr_boundary(result_image, points_corrected)
             result_image = pose_estimation.draw_axes(result_image, camera_matrix, dist_coeffs, rvec, tvec)
         with self.result_image_lock:
-            self.latest_result_image = result_image.copy() if result_image is not None else None
+            self.latest_result_image = result_image  # result_image 已是新对象，无需 copy
 
         # QR 中心像素
         center_pt = np.mean(points_corrected, axis=0)
@@ -873,9 +1008,22 @@ class WinPoseEstimatorV2:
         self.gimbal_op.target_yaw = target_yaw
         self.gimbal_op.target_pitch = target_pitch
 
-        # ── 水平偏移判断 → 机器人移动建议 ──
+        # ── 机器人移动建议 + 云台操作建议 ──
         lat_dead = get_config_value(self._cfg, "lateral_judge", "dead_zone_m", default=0.02)
-        judge_lateral_position(pose_data, lat_dead=lat_dead)
+        lat_safe = get_config_value(self._cfg, "lateral_judge", "lat_safe_zone_m", default=0.2)
+        nav_info = judge_lateral_position(pose_data, lat_safe=lat_safe, lat_dead=lat_dead)
+
+        # ── 云台操作建议 (基于成像质量评估) ──
+        iq_cfg = self._cfg.get("imaging_quality", {})
+        print(f"\n  {'─'*40}")
+        print(f"  【云台操作建议】")
+        print(f"  {'─'*40}")
+        print(f"  QR像素偏移: ΔX={int(dx):+d}px ΔY={int(dy):+d}px")
+        print(f"  云台调整: Yaw {dyaw:+.2f}°  Pitch {dpitch:+.2f}°")
+        if abs(dyaw) < angle_dead and abs(dpitch) < angle_dead:
+            print(f"  ✓ 云台无需调整 (偏差在死区内)")
+        else:
+            print(f"  → [Gimbal.follow] Yaw={target_yaw:.2f}° Pitch={target_pitch:.2f}°")
 
         # ── 修正位姿数据 ──
         print(f"\n{'─'*40}")
@@ -899,6 +1047,13 @@ class WinPoseEstimatorV2:
             except Exception as e:
                 print(f"\n  ✗ 云台旋转失败: {e}")
 
+        # 云台旋转后重建 RTSP 连接 (避免长时间不读帧导致解码器异常)
+        if self.video_capture is not None:
+            self.video_capture.release()
+        self.video_capture = cv2.VideoCapture(self.rtsp_tv, cv2.CAP_FFMPEG)
+        self.video_capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        time.sleep(0.3)
+
         # ── 成像质量评估：修正前 (红色原始姿态) ──
         iq_cfg = self._cfg.get("imaging_quality", {})
         print(f"\n【最佳成像评估】(基于修正前姿态 — 红色视锥)")
@@ -921,6 +1076,23 @@ class WinPoseEstimatorV2:
             view_angle_thresh_deg=iq_cfg.get("view_angle_thresh_deg", 15.0),
             plane_angle_thresh_deg=iq_cfg.get("plane_angle_thresh_deg", 15.0),
         )
+
+        # ── 执行机器狗左右移动 (基于QR的X坐标判断方向, 固定步长) ──
+        cam_x = pose_data.get("camera_position", np.zeros(3))[0]
+        lat_safe = get_config_value(self._cfg, "lateral_judge", "lat_safe_zone_m", default=0.2)
+        if abs(cam_x) > lat_safe and self._dog is not None:
+            dog_cfg = self._cfg.get("dog_navigator", {})
+            step = dog_cfg.get("lateral_step_m", 0.1)
+            if cam_x > 0:   # QR坐标系 X+ = 相机偏右 → 狗左移(SDK y+)
+                direction, move_y = "左", step
+            else:           # cam_x < 0 → 相机偏左 → 狗右移(SDK y-)
+                direction, move_y = "右", -step
+            print(f"\n  🐕 机器狗移动: QR_X={cam_x:+.3f}m → 向{direction}移 {step:.2f}m (步长)")
+            try:
+                self._dog.move(x=0, y=move_y, z=0)
+                print(f"  ✓ 机器狗移动完成")
+            except Exception as e:
+                print(f"  ✗ 机器狗移动失败: {e}")
 
         # ── 3D 可视化 (红色=旋转前, 蓝色=旋转后) ──
         print(f"\n【3D可视化】已准备数据 (红色=旋转前, 蓝色=旋转后)")
@@ -1140,13 +1312,12 @@ def main():
             print("按 'q' 退出")
             print("=" * 55)
             estimator.start_video_stream()
-            # HTTP 模式下 start_video_stream 会阻塞直到退出
-            if not estimator._use_http_display:
-                try:
-                    while estimator.video_running:
-                        time.sleep(0.2)
-                except KeyboardInterrupt:
-                    print("\n用户中断")
+            # 等待视频线程结束
+            try:
+                while estimator.video_running:
+                    time.sleep(0.2)
+            except KeyboardInterrupt:
+                print("\n用户中断")
         elif args.mode == "loop":
             if args.image:
                 print(f"\n[Loop] 图片固定: {args.image}，每 {loop_interval}s 一轮\n")

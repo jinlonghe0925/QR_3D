@@ -494,22 +494,74 @@ def compute_gimbal_target(dx: float, dy: float, fov_x_actual: float,
     return dyaw, dpitch, target_yaw, target_pitch
 
 
-def judge_lateral_position(pose_data: dict, lat_dead: float = 0.02):
-    """判断相机在 QR 的左右位置，给出机器人移动建议。
+def judge_lateral_position(pose_data: dict, lat_safe: float = 0.2, lat_dead: float = 0.02) -> dict:
+    """判断相机在 QR 的左右/前后位置，给出机器人移动建议。
 
     参数:
         pose_data: 位姿数据 (含 camera_position)
+        lat_safe:  水平安全区 (米), 默认 0.2, 超出才移动
         lat_dead:  水平死区 (米), 默认 0.02
+
+    返回:
+        {"dog_move": {"x": 0, "y": 0, "need_move": False}, "info": "..."}
+        dog_move.x: 前进距离 (正=前)
+        dog_move.y: 侧移距离 (正=左, SDK约定)
     """
     cam_pos = pose_data.get("camera_position", np.zeros(3))
-    cam_x = cam_pos[0]
+    cam_x = cam_pos[0]   # QR 坐标系 X: 右+
+    cam_z = cam_pos[2]   # QR 坐标系 Z: 板外(相机方向)
+    distance = np.linalg.norm(cam_pos)
 
-    if cam_x > lat_dead:
-        print(f"  ▶ 相机在QR【右侧】(X={cam_x:+.3f}m)，请向【左←】移动机器人")
-    elif cam_x < -lat_dead:
-        print(f"  ▶ 相机在QR【左侧】(X={cam_x:+.3f}m)，请向【右→】移动机器人")
+    print(f"\n  {'─'*40}")
+    print(f"  【机器狗导航建议】")
+    print(f"  {'─'*40}")
+    print(f"  相机位置 (QR坐标系): X={cam_x:+.3f}m  Y={cam_pos[1]:+.3f}m  Z={cam_z:+.3f}m")
+    print(f"  相机到QR距离: {distance:.3f}m")
+
+    # 左右偏移 (lat_safe 以内视为安全, 不需要移动)
+    lat_safe = max(lat_dead, lat_safe)
+    dog_y = 0.0  # 侧移: 正=左移(SDK)
+    if cam_x > lat_safe:
+        dog_y = -(cam_x - lat_safe)  # QR右+ → 狗左移(SDK y+)
+        print(f"  ▶ 水平偏移: 偏右 {cam_x:+.3f}m → 机器狗左移 {abs(dog_y):.3f}m")
+    elif cam_x < -lat_safe:
+        dog_y = (-cam_x - lat_safe)  # QR左+ → 狗右移(SDK y-)
+        print(f"  ▶ 水平偏移: 偏左 {cam_x:+.3f}m → 机器狗右移 {abs(dog_y):.3f}m")
     else:
-        print(f"  ✓ 水平方向【已对齐】(X={cam_x:+.3f}m)")
+        print(f"  ✓ 水平方向已对齐 (偏差 {cam_x:+.3f}m, 安全区 ±{lat_safe}m)")
+
+    # 前后距离
+    STOP_DIST = 0.8
+    dog_x = 0.0  # 前进: 正=前(SDK)
+    if cam_z > STOP_DIST:
+        dog_x = cam_z - STOP_DIST
+        print(f"  ▶ 前后距离: {cam_z:.3f}m > {STOP_DIST}m → 机器狗前进 {dog_x:.3f}m")
+    elif cam_z < -STOP_DIST:
+        dog_x = cam_z + STOP_DIST  # 负值=后退
+        print(f"  ▶ 前后距离: {cam_z:.3f}m < 0 → 机器狗后退 {-dog_x:.3f}m")
+    else:
+        print(f"  ✓ 前后距离: {cam_z:.3f}m (安全范围)")
+
+    # 综合指令
+    cmd_parts = []
+    if abs(dog_y) > 0.01:
+        cmd_parts.append(f"y={dog_y:+.3f}m")
+    if abs(dog_x) > 0.01:
+        cmd_parts.append(f"x={dog_x:+.3f}m")
+
+    if cmd_parts:
+        print(f"  → [Dog.move] " + ", ".join(cmd_parts))
+    else:
+        print(f"  → [Dog.move] 无需移动，已在目标位置")
+    print(f"  {'─'*40}")
+
+    return {
+        "need_move": abs(dog_x) > 0.01 or abs(dog_y) > 0.01,
+        "x": dog_x,
+        "y": dog_y,
+        "distance": distance,
+        "cam_z": cam_z,
+    }
 
 
 def build_aligned_pose(pose_data: dict, dyaw: float, dpitch: float) -> dict:
