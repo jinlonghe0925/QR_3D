@@ -30,6 +30,7 @@ Override with:
 
 import argparse
 import os
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -48,6 +49,54 @@ DEFAULT_MODEL_PATH = Path(__file__).resolve().parent / "models" / "qr_yolov8.om"
 def _check_acl(ret: int, action: str) -> None:
     if ret != 0:
         raise RuntimeError(f"ACL failed during {action}, ret={ret}")
+
+
+# ── ACL 进程级生命周期管理 ───────────────────────────────────────────
+# 三个接口的作用域完全不同, 混用就会出下面这两个经典错误码:
+#
+#   acl.init()           【进程级】重复调用返回
+#                        ACL_ERROR_REPEAT_INITIALIZE(100002)。
+#                        这**不是错误**, 只表示本进程已初始化过, 必须忽略;
+#                        否则第二个线程加载模型时会直接报
+#                        "ACL failed during acl.init, ret=100002"。
+#   acl.finalize()       【进程级】一旦调用, 整个进程的 ACL 全部失效。
+#                        多线程场景下绝不能让某个线程单独调用,
+#                        否则其他线程下一次 memcpy/malloc 全部失败。
+#   acl.rt.set_device()  【线程级】每个要在 NPU 上推理的线程都必须自己调
+#                        一次, 否则该线程 context 为空, 后续会报
+#                        107002 (ACL_ERROR_RT_CONTEXT_NULL) —— 即
+#                        "ACL failed during copy input host to device"。
+#
+# 所以用引用计数统一管理: 第一个检测器实例真正调 acl.init(),
+# 最后一个实例释放时才 acl.finalize()。
+ACL_ERROR_REPEAT_INITIALIZE = 100002
+
+_ACL_LOCK = threading.Lock()
+_ACL_REFS = 0
+
+
+def _acl_acquire(acl) -> None:
+    """进程级 ACL 引用计数 +1 (仅首次真正调用 acl.init)。"""
+    global _ACL_REFS
+    with _ACL_LOCK:
+        if _ACL_REFS == 0:
+            ret = acl.init()
+            if ret != 0 and ret != ACL_ERROR_REPEAT_INITIALIZE:
+                raise RuntimeError(f"ACL failed during acl.init, ret={ret}")
+        _ACL_REFS += 1
+
+
+def _acl_release_ref(acl) -> None:
+    """进程级 ACL 引用计数 -1 (归零时才 acl.finalize)。"""
+    global _ACL_REFS
+    with _ACL_LOCK:
+        if _ACL_REFS > 0:
+            _ACL_REFS -= 1
+        if _ACL_REFS == 0:
+            try:
+                acl.finalize()
+            except Exception:
+                pass
 
 
 def _letterbox(
@@ -519,8 +568,17 @@ class AscendYoloQRDetector:
             ) from exc
 
         self.acl = acl
-        _check_acl(acl.init(), "acl.init")
-        _check_acl(acl.rt.set_device(self.device_id), "acl.rt.set_device")
+        # 进程级初始化: 重复调用返回 100002 属正常, 由引用计数统一管理
+        _acl_acquire(acl)
+        # 线程级绑定: 每个要在 NPU 上推理的线程都必须自己调一次,
+        #            否则本线程 context 为空 (后续 memcpy 报 107002)。
+        # 同一线程重复调用会返回 100002 (REPEAT_INITIALIZE), 说明本线程
+        # 已经持有 device, 正是我们想要的状态, 一并容忍。
+        ret = acl.rt.set_device(self.device_id)
+        if ret != 0 and ret != ACL_ERROR_REPEAT_INITIALIZE:
+            _acl_release_ref(acl)
+            self.acl = None
+            raise RuntimeError(f"ACL failed during acl.rt.set_device, ret={ret}")
 
         self.model_id, ret = acl.mdl.load_from_file(self.model_path)
         _check_acl(ret, "acl.mdl.load_from_file")
@@ -792,8 +850,17 @@ class AscendYoloQRDetector:
             acl.mdl.destroy_desc(self.model_desc)
         if self.model_id is not None:
             acl.mdl.unload(self.model_id)
-        acl.rt.reset_device(self.device_id)
-        acl.finalize()
+        # 线程级: 释放『当前线程』持有的 device/context。
+        # 注意: 若 release() 在非加载线程执行(例如 __del__ 被 GC 线程触发),
+        #       reset_device 会失败, 此处必须容忍, 不能中断后面的引用计数释放。
+        try:
+            acl.rt.reset_device(self.device_id)
+        except Exception:
+            pass
+        # 进程级: 引用计数归零才 finalize。
+        # 绝不能在这里无条件 acl.finalize() —— 会把其他线程(常驻推理线程)
+        # 正在使用的 ACL 一起销毁, 导致它们下一次推理全部失败。
+        _acl_release_ref(acl)
         self.acl = None
         self.model_id = None
         self.model_desc = None

@@ -209,7 +209,8 @@ def render_plotly_html(data: dict, config: dict = None) -> str:
         template='plotly_dark',
     )
 
-    return fig.to_html(include_plotlyjs='cdn', full_html=True)
+    # 'inline' = plotly.js 内嵌进 HTML (~4MB), 完全离线可用 (板子无 CDN 网络)
+    return fig.to_html(include_plotlyjs='inline', full_html=True)
 
 
 # ═══════════════════════════════════════════════════════════

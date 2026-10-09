@@ -51,6 +51,10 @@ class GimbalController:
         self._focal_length_value = None  # 存储查询到的焦距值（mm）
         self._fov_x_value = None  # 存储查询到的水平视场角（度）
         self._fov_y_value = None  # 存储查询到的垂直视场角（度）
+        self._focal_length_x = None  # 物理焦距 x（mm）
+        self._focal_length_y = None  # 物理焦距 y（mm）
+        self._focal_length_raw = None  # 最近一次 FOV 查询响应的原始字节 (调试用)
+        self._fov_debug = False  # FOV 查询调试开关: 打印此期间收到的所有 UDP 包
 
         # 伺服参数查询同步
         self._servo_params_lock = threading.Lock()
@@ -415,26 +419,43 @@ class GimbalController:
             self._focal_length_event.clear()
 
         # 发送可见光状态查询命令 (帧ID=0x01, 控制字=0x10)
-        # 长度固定为0x10
-        query_body = bytes([0x10]) + b"\x00" * 15  # 控制字 + 15字节填充
-        self._send_cmd(fid=0x01, body=query_body)
-        print("已发送状态查询命令 (控制字=0x10)")
+        # 帧长不确定 (无协议文档), 两种都试: 长帧 0x10 / 短帧 0x0A, 各重发一轮
+        # 有些设备需要轮询触发, 每个变体间隔重发
+        self._fov_debug = True
+        variants = [
+            ("len=0x10", 0x10, bytes([0x10]) + b"\x00" * 14),
+            ("len=0x0A", 0x0A, bytes([0x10]) + b"\x00" * 8),
+        ]
 
-        # 等待响应
         start_time = time.time()
+        send_idx = 0
         while time.time() - start_time < timeout:
-            if self._focal_length_event.wait(timeout=min(0.5, timeout - (time.time() - start_time))):
+            # 轮流重发两种格式 (每 0.5s 一发)
+            name, length, body = variants[send_idx % len(variants)]
+            send_idx += 1
+            packet = self._build_packet(length, 0x01, body)
+            hex_str = ' '.join(f'{b:02X}' for b in packet)
+            print(f"  发送[{name}]: {len(packet)}B [{hex_str}] → {self.target_ip}:{self.target_port}")
+            try:
+                self.sock.sendto(packet, (self.target_ip, self.target_port))
+            except Exception as e:
+                print(f"  ✗ 发送失败: {e}")
+                break
+
+            # 等一小段看是否有响应
+            remaining = timeout - (time.time() - start_time)
+            if self._focal_length_event.wait(timeout=min(0.5, max(0.0, remaining))):
                 with self._focal_length_lock:
                     focal_length = self._focal_length_value
                     fov_x = self._fov_x_value
                     fov_y = self._fov_y_value
                 print(f"✓ fov_x: {fov_x:.1f}°, fov_y: {fov_y:.1f}°")
                 print(f"✓ focal_length_x: {focal_length:.1f}mm, focal_length_y: {focal_length:.1f}mm")
+                self._fov_debug = False
                 return fov_x, fov_y, focal_length, focal_length
-            if time.time() - start_time >= timeout:
-                break
 
-        print("✗ 查询焦距和视场角超时")
+        print("✗ 查询焦距和视场角超时 (两种帧格式均无响应)")
+        self._fov_debug = False
         return None, None, None, None
 
     def get_zoom_info(self):
@@ -491,6 +512,12 @@ class GimbalController:
         while self._running:
             try:
                 data, addr = self.sock.recvfrom(65535)
+
+                # FOV 查询调试: 打印此期间收到的所有 UDP 原始包 (在 addr 过滤之前, 避免漏掉)
+                if getattr(self, '_fov_debug', False):
+                    hex_head = ' '.join(f'{b:02X}' for b in data[:24])
+                    logger.info(f"[FOV调试] 收到 {len(data)}B 来自 {addr[0]}:{addr[1]} [{hex_head}]")
+
                 if addr[0] != self.target_ip:
                     continue
 
@@ -505,7 +532,11 @@ class GimbalController:
                 # 字节7-8: 倍率H/L (有效值*10)
                 # 字节9-10: 焦距H/L (有效值*10, 单位mm)
                 if fid == 0x01 and len(data) >= 11:
+                    # 打印原始响应, 方便核对协议字节偏移 (只在等待查询时打印, 避免刷屏)
+                    hex_str = ' '.join(f'{b:02X}' for b in data[:min(24, len(data))])
+                    logger.info(f"收到可见光状态响应: {len(data)}B [{hex_str}]")
                     with self._focal_length_lock:
+                        self._focal_length_raw = data
                         status_word = data[4]
                         # 解析水平视场角 (字节5-6)
                         fov_h = data[5]
