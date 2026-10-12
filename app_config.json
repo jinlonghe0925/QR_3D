@@ -16,7 +16,7 @@
         "_说明": "相机内参与物理参数",
         "fov_x": 60.0,
         "fov_y": 34.0,
-        "qr_size": 0.10,
+        "qr_size": 0.12,
         "camera_intrinsics_path": ""
     },
 

@@ -641,8 +641,8 @@ class GimbalPoseEstimator:
         if qr_size is None:
             qr_size = config_data.get("estimate", {}).get("qr_size", 0.1)
             print(f"  从配置文件读取 qr_size -------------------------: {qr_size} 米")
-        qr_size = 0.05
-        #qr_size = 0.12
+        #qr_size = 0.05
+        qr_size = 0.12
 
         print(f" qr_size -------------------------: {qr_size} 米")
 

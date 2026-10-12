@@ -26,7 +26,7 @@
     },
     "estimate": {
         "image": null,
-        "qr_size": 0.049,
+        "qr_size": 0.12,
         "fov_x": 60.0,
         "model_size": "s",
         "detector": "opencv",
