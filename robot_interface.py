@@ -37,7 +37,11 @@ VMAX_Z = 60.0   # 旋转满速 (°/s)
 STREAM_HZ     = 20.0     # 轴指令下发频率 (Hz)
 AXIS_MAX      = 32767    # 摇杆满量程 (±32767)
 STOP_FRAMES   = 8        # 松手后补发零速帧数 (确保被接收)
-HEARTBEAT_HZ  = 0.0      # 流内附带心跳频率 (0=不发; 若运控要求心跳可设 1.0)
+# ★ Bug 修复: 流内必须带心跳!
+#   之前 HEARTBEAT_HZ=0.0 → stream 20Hz 持续 0.67s 全部被运控看门狗丢弃 → 狗不动
+#   现在改为 5.0Hz → 每 4 帧 (200ms) 发一次 heartbeat → 运控保活
+#   (短流如 13 帧也能保证至少 3-4 次心跳)
+HEARTBEAT_HZ  = 5.0      # 流内附带心跳频率 (0=不发; 5.0=每 200ms 1 次)
 
 # ======================= UDP 指令码 =======================
 _HEARTBEAT    = 0x21040001
@@ -67,8 +71,17 @@ class Dog:
         self._addr = (ip, port)
         self._ready = False     # 是否已起立且「开始运动」已使能
 
-    def _send(self, code, value):
-        self._sock.sendto(struct.pack('<3I', code, _u32(value), 0), self._addr)
+    def _send(self, code, value, debug=False):
+        try:
+            self._sock.sendto(struct.pack('<3I', code, _u32(value), 0), self._addr)
+            if debug:
+                # ★ 诊断模式: 打印每个发出去的 UDP 包
+                print(f"[Dog] → UDP code=0x{code:08X} value={value} target={self._addr}")
+        except OSError as e:
+            # UDP sendto 失败 (网络不通/狗掉线) → 立即打印, 不吞掉
+            print(f"[Dog] ✗ UDP 发送失败: code=0x{code:08X} value={value} → {e}")
+            print(f"[Dog]   目标: {self._addr}, 请检查: 1)网线 2)狗 IP 3)防火墙")
+            raise
 
     @property
     def ready(self):
@@ -84,12 +97,12 @@ class Dog:
           - 缺「开始运动」→ 狗完全不踏步 (腿不动)
           - 两者齐全 → 狗原地踏步; 切对 gait 后才能前进
         """
-        self._send(_HEARTBEAT, 0)                     # 先"注册"客户端
-        self._send(_STAND_UP, 0);     sleep(1.5)
-        self._send(_MANUAL_MODE, 0);   sleep(0.5)
-        self._send(_FORCE_CONTROL, 0); sleep(0.5)
-        self._send(_START_MOTION, 0);  sleep(0.5)
-        self._send(gait, 0);           sleep(0.5)
+        self._send(_HEARTBEAT, 0, debug=True)                     # 先"注册"客户端
+        self._send(_STAND_UP, 0, debug=True);     sleep(1.5)
+        self._send(_MANUAL_MODE, 0, debug=True);   sleep(0.5)
+        self._send(_FORCE_CONTROL, 0, debug=True); sleep(0.5)
+        self._send(_START_MOTION, 0, debug=True);  sleep(0.5)
+        self._send(gait, 0, debug=True);           sleep(0.5)
         self._ready = True
         self._gait = gait
 
@@ -99,9 +112,24 @@ class Dog:
         第二步 (在 start_motion 之前必须先发), 让腿进入柔性模式。
         缺它: 移动指令被运控丢弃。
         """
-        self._send(_MANUAL_MODE, 0);   sleep(0.3)
-        self._send(_FORCE_CONTROL, 0); sleep(0.4)
+        self._send(_MANUAL_MODE, 0, debug=True);   sleep(0.3)
+        self._send(_FORCE_CONTROL, 0, debug=True); sleep(0.4)
         self._ready = True
+
+    def stand_quiet(self):
+        """「静默起立」: 起立+手动+力控, 但**不发** 开始运动+gait (腿保持静止)
+
+        适用场景: 拍 QR / 拍照 / 视频采集时, 狗需要站着但**不能踏步**
+        (踏步会让身体微抖, 拍出来的图像模糊 / 位姿抖动)。
+        之后调用 start_motion() + set_gait(行走) 才会让狗真的能移动。
+        """
+        self._send(_HEARTBEAT, 0, debug=True)                     # 先"注册"客户端
+        self._send(_STAND_UP, 0, debug=True);     sleep(1.5)
+        self._send(_MANUAL_MODE, 0, debug=True);   sleep(0.5)
+        self._send(_FORCE_CONTROL, 0, debug=True); sleep(0.5)
+        # ★ 不发 START_MOTION 也不发 gait → 狗站着腿不动
+        self._ready = True
+        self._gait = None  # 标记未发 gait, 后续需主动调 start_motion + set_gait
 
     def start_motion(self):
         """「开始运动」使能 (对应遥控器上的同名按钮)。阻塞约 1 秒
@@ -109,10 +137,20 @@ class Dog:
         第三步 (在 force_control 之后发), 启动腿部步态循环。
         缺它: 狗完全不踏步; 两者齐全后狗才会「原地踏步」,
         此时再切对 gait 才能前进。
+
+        ★ Bug 修复: 补发 MANUAL_MODE + FORCE_CONTROL + HEARTBEAT
+          因为 stand_quiet 后 _ready=True, 但有些运控版本会"忘记"
+          之前的力控状态, 在收到 AXIS 指令时仍当作"未力控"拒收。
+          显式重发确保 100% 生效。
         """
-        self._send(_START_MOTION, 0);  sleep(0.5)
+        self._send(_HEARTBEAT, 0, debug=True)
+        self._send(_MANUAL_MODE, 0, debug=True);   sleep(0.2)
+        self._send(_FORCE_CONTROL, 0, debug=True); sleep(0.3)
+        self._send(_START_MOTION, 0, debug=True);  sleep(0.5)
         gait = getattr(self, '_gait', _GAIT_DEFAULT)
-        self._send(gait, 0);           sleep(0.3)
+        if gait is None:
+            gait = _GAIT_DEFAULT
+        self._send(gait, 0, debug=True);           sleep(0.3)
         self._ready = True
         self._gait = gait
 
@@ -124,7 +162,7 @@ class Dog:
           0x21010301  小跑/行走 (body 平移)
           0x21010302  奔跑
         """
-        self._send(gait, 0)
+        self._send(gait, 0, debug=True)
         sleep(0.3)
         self._gait = gait
         print(f"[Dog] 步态已切换: 0x{gait:08X}")
@@ -189,24 +227,39 @@ class Dog:
         a = int(max(-1.0, min(1.0, vx)) * AXIS_MAX)
         b = int(max(-1.0, min(1.0, vy)) * AXIS_MAX)
         c = int(max(-1.0, min(1.0, vz)) * AXIS_MAX)
+        # ★ Bug 修复: 流开始先发 1 次 heartbeat, 运控收到心跳才"开门"接收控制流
+        self._send(_HEARTBEAT, 0, debug=True)
+        # ★ 诊断: 打印归一化速度 + 实际字节值
+        print(f"[Dog] stream: n={n} frames, vx={vx:+.2f}→a={a}, vy={vy:+.2f}→b={b}, vz={vz:+.2f}→c={c}")
         for i in range(n):
-            self._send(_AXIS_LY, a)
-            self._send(_AXIS_LX, b)
-            self._send(_AXIS_RX, c)
+            if i == 0 or i == n-1:  # 只 print 首末帧, 避免刷屏
+                self._send(_AXIS_LY, a, debug=True)
+                self._send(_AXIS_LX, b, debug=True)
+                self._send(_AXIS_RX, c, debug=True)
+            else:
+                self._send(_AXIS_LY, a)
+                self._send(_AXIS_LX, b)
+                self._send(_AXIS_RX, c)
             if hb_every and i % hb_every == 0:
-                self._send(_HEARTBEAT, 0)
+                self._send(_HEARTBEAT, 0, debug=True)
             sleep(period)
+        # 流结束再发 1 次 heartbeat, 让运控识别"流结束"
+        self._send(_HEARTBEAT, 0, debug=True)
         if stop_after:
             self.stop_move(hz=hz)
 
     def stop_move(self, hz=STREAM_HZ):
         """停止移动: 补发若干零速帧 (松手), 确保运控收到并刹住"""
         period = 1.0 / max(1.0, float(hz))
+        # 先发 heartbeat 让运控"开门", 再发零速帧
+        self._send(_HEARTBEAT, 0, debug=True)
+        print(f"[Dog] stop_move: 发 {STOP_FRAMES} 帧零速 (LY/LX/RX = 0/0/0)")
         for _ in range(STOP_FRAMES):
             self._send(_AXIS_LY, 0)
             self._send(_AXIS_LX, 0)
             self._send(_AXIS_RX, 0)
             sleep(period)
+        self._send(_HEARTBEAT, 0)
 
     def raw(self, code, value=0, n=1, period=0.05):
         """裸指令发送 (排查用): 把 code/value 重复发送 n 次, 间隔 period 秒"""

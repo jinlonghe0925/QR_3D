@@ -746,7 +746,7 @@ class GimbalPoseEstimator:
         
         # 多帧平滑属性
         self._pose_history: list = []      # 滑动窗口: [(pose_data, weight), ...]
-        self._pose_window_size = 10        # 窗口大小
+        self._pose_window_size = 3         # 窗口大小 (用户要求: 5→3 帧, 减少重复帧计算)
         self._pose_ema_alpha = 0.35        # EMA 平滑系数 (0=完全依赖历史, 1=完全依赖新帧)
         
         print("\n" + "=" * 60)
@@ -1778,6 +1778,12 @@ class GimbalPoseEstimator:
                 dog.init()                      # 起立→手动→力控→步态 (约3s)
                 print("[狗] 起立+力控完成, 运动就绪")
                 return f"✓ 已起立并力控 ({getattr(self, '_dog_ip', '')})"
+            if act in ('stand_quiet', 'quiet_stand', 'stand_no_motion'):
+                # ★ V2 专用: 静默起立 (起立+手动+力控, 不发开始运动+gait, 腿保持静止)
+                # 适合拍 QR / 拍照, 避免踏步导致图像抖动
+                dog.stand_quiet()               # ≈2.5s
+                print("[狗] 静默起立 (腿不动, 适合拍 QR)")
+                return f"✓ 已静默起立 ({getattr(self, '_dog_ip', '')}), 腿保持静止, 可拍 QR"
             if act in ('force', 'force_control'):
                 dog.force_control()              # 单独补发「力控」(第②步, 缺它移动指令被丢)
                 print("[狗] 力控 (第②步)")

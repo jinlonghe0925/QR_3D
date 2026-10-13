@@ -532,9 +532,10 @@ class GimbalController:
                 # 字节7-8: 倍率H/L (有效值*10)
                 # 字节9-10: 焦距H/L (有效值*10, 单位mm)
                 if fid == 0x01 and len(data) >= 11:
-                    # 打印原始响应, 方便核对协议字节偏移 (只在等待查询时打印, 避免刷屏)
-                    hex_str = ' '.join(f'{b:02X}' for b in data[:min(24, len(data))])
-                    logger.info(f"收到可见光状态响应: {len(data)}B [{hex_str}]")
+                    # ★ 已屏蔽: 这条 info 每 0.16s 打印一次, 疯狂刷屏
+                    #   如果想调试协议字节, 临时把下行注释解除
+                    # hex_str = ' '.join(f'{b:02X}' for b in data[:min(24, len(data))])
+                    # logger.info(f"收到可见光状态响应: {len(data)}B [{hex_str}]")
                     with self._focal_length_lock:
                         self._focal_length_raw = data
                         status_word = data[4]
