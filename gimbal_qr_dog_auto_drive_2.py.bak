@@ -1,0 +1,2780 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+gimbal_qr_dog_auto_drive_2.py
+==============================
+两段式 QR 位姿 → 机器狗 自动导航 (V2 策略)
+
+V1 → V2 关键变化:
+  ┌────────────────────────────────────────────────────────────┐
+  │  V1:  1 个「📸 捕获」按钮, 1 套「执行横移/变倍」组合按钮   │
+  │       冻结快照 + 估计/执行耦合, 一次流程里横移+变倍可同时发│
+  │                                                            │
+  │  V2:  2 个「📸 捕获」按钮 (① 第一次 / ② 第二次) 区分两段  │
+  │       2 个「执行」按钮 (① 横移 / ② 云台+变倍) 各自独立     │
+  │       硬件动作全部按钮驱动, 不链式自动                      │
+  │       两次捕获底层算法完全相同                              │
+  │       第一次执行不动云台, 第二次执行才把云台转回图像中心     │
+  └────────────────────────────────────────────────────────────┘
+
+V2 完整工作流 (按 UI 顺序):
+  阶段 0  idle
+     ↓ 📸① 第一次捕获
+  阶段 1  first_captured
+     ↓ ↔️① 执行横移 (调狗)
+  阶段 2  first_executed      ← 狗在动
+     ↓ ✓ 标记: 狗已就位
+  阶段 3  dog_ready
+     ↓ 📸② 第二次捕获
+  阶段 4  second_captured
+     ↓ 🔄② 执行云台+变倍
+  阶段 5  done
+
+底层算法不变 (复用参照 gimbal_pose_estimation_ascend.py 的多帧采集 + PnP 解算);
+新增的只是:
+  1) 状态机 + 5 个阶段函数
+  2) 图像中心 ↔ 云台角度 换算 (_compute_gimbal_center_offset)
+  3) V2 路由 (5 个) + V2 HTML 页面 (5 步带状态指示)
+
+调用方式:
+  python3 gimbal_qr_dog_auto_drive_2.py --mode video --model models/qr_yolov8.om
+  然后浏览器开 http://<ip>:5003/qr_nav2
+  完整保留 V1 页面 /qr_nav 供对比/回退
+"""
+
+import os
+import sys
+import io
+import time
+import json
+import math
+import logging
+import tempfile
+import threading
+import argparse
+import contextlib
+
+import numpy as np
+import cv2
+
+
+# ============================================================
+#  关键: 复用参照文件 (云台 / YOLO / 视频流 / HTTP 控制台)
+# ============================================================
+import gimbal_pose_estimation_ascend as _gpea
+
+
+# ============================================================
+#  全局状态 (QR 导航面板的 pose/msg buffer)
+# ============================================================
+class _JpegBuffer:
+    """线程安全 + Condition 零空转 JPEG 帧缓冲"""
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._jpg = b""
+
+    def update(self, jpg: bytes):
+        with self._cond:
+            self._jpg = jpg
+            self._cond.notify_all()
+
+    def wait(self, timeout: float = 0.5) -> bytes:
+        with self._cond:
+            self._cond.wait(timeout)
+            return self._jpg
+
+
+_qrnav_pose_lock    = threading.Lock()
+_qrnav_pose_box     = [None]
+_qrnav_pose_ver     = [0]
+_qrnav_pose_msg_box = ["等待 QR 检测…"]
+_qrnav_img_w_box    = [0]
+_qrnav_img_h_box    = [0]   # V2 新增: 给中心换算用
+_qrnav_poll_busy    = threading.Lock()
+
+_qrnav_jpg_buf = _JpegBuffer()
+
+
+# ============================================================
+#  Helpers (与 V1 保持一致)
+# ============================================================
+def _get_gimbal_angles():
+    try:
+        est = _qrnav_estimator_holder[0]
+        if est is None:
+            return 0.0, 0.0, 0.0
+        gimbal = getattr(est, "gimbal", None)
+        if gimbal is None:
+            return 0.0, 0.0, 0.0
+        ya, yp, _ = gimbal.get_current_angles()
+        return float(ya), float(yp), 0.0
+    except Exception:
+        return 0.0, 0.0, 0.0
+
+
+def _compute_fill_ratio(pose, img_w):
+    if pose is None or img_w <= 0:
+        return 0.0
+    img_pts = pose.get("image_points")
+    if img_pts is None or len(img_pts) < 4:
+        return 0.0
+    try:
+        pts = np.asarray(img_pts, dtype=float).reshape(-1, 2)
+        if len(pts) < 4:
+            return 0.0
+        s01 = float(np.linalg.norm(pts[0] - pts[1]))
+        s12 = float(np.linalg.norm(pts[1] - pts[2]))
+        s23 = float(np.linalg.norm(pts[2] - pts[3]))
+        s30 = float(np.linalg.norm(pts[3] - pts[0]))
+        return (s01 + s12 + s23 + s30) / 4.0 / float(img_w)
+    except Exception:
+        return 0.0
+
+
+def _camera_pos_to_base(cam_pos, gimbal_yaw_deg):
+    yaw_sign = _QR_NAV_CFG.get("YAW_SIGN", +1)
+    yaw = np.radians(gimbal_yaw_deg) * yaw_sign
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    tx = ty = tz = 0.0
+    try:
+        est = _qrnav_estimator_holder[0]
+        pose = getattr(est, "latest_pose_data", None) if est else None
+        if pose is not None and "tvec" in pose:
+            tvec = np.array(pose["tvec"], dtype=float).flatten()
+            if len(tvec) >= 3 and not (tvec[0] == 0 and tvec[2] == 0):
+                tx, ty, tz = float(tvec[0]), float(tvec[1]), float(tvec[2])
+        if tx == 0 and tz == 0 and cam_pos is not None:
+            tx = -float(cam_pos[0])
+            ty = -float(cam_pos[1])
+            tz = -float(cam_pos[2])
+    except Exception:
+        pass
+    base_x = cy * tx + sy * tz
+    base_z = -sy * tx + cy * tz
+    base_y = ty
+    return float(base_x), float(base_y), float(base_z)
+
+
+def _qr_size_est():
+    try:
+        return float(getattr(_qrnav_estimator_holder[0], "qr_size", 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _qr_size_resolved():
+    return _qr_size_est() or float(_QR_NAV_CFG.get("QR_SIZE_M", 0.12))
+
+
+def pose_to_command(pose):
+    if pose is None:
+        return {
+            "ready": False, "distance": None, "lateral_x": None,
+            "camera_y": None, "camera_z": None,
+            "lateral_world": None, "forward_world": None,
+            "gimbal_yaw_deg": None,
+            "turn_dir": "中", "turn_sign": 0, "rotate_hint_deg": 0.0,
+            "fill_ratio": None, "zoom_needed": False, "zoom_factor": 1.0,
+            "angle_to_plane": None, "qr_yaw": 0.0, "qr_pitch": 0.0,
+            "decoded": "", "hint": "等待 QR 检测…",
+        }
+
+    cfg = _QR_NAV_CFG
+    if "camera_position" in pose:
+        cam = np.array(pose["camera_position"], dtype=float).flatten()
+    else:
+        rvec = np.array(pose["rvec"], dtype=float).reshape(3, 1)
+        tvec = np.array(pose["tvec"], dtype=float).reshape(3, 1)
+        rmat, _ = cv2.Rodrigues(rvec)
+        cam = (-rmat.T @ tvec).flatten()
+    x, y, z = float(cam[0]), float(cam[1]), float(cam[2])
+    dist = float(np.linalg.norm(cam))
+    lateral_x = x
+
+    gimbal_yaw_deg, gimbal_pitch_deg, _ = _get_gimbal_angles()
+    base_x, base_y, base_z = _camera_pos_to_base(cam, gimbal_yaw_deg)
+    lateral_world = base_x if base_x is not None else None
+    forward_world = base_z if base_z is not None else None
+
+    if lateral_world is None:
+        turn_dir, turn_sign = "?", 0
+    else:
+        lat_eff = lateral_world * cfg.get("LATERAL_SIGN", -1)
+        if   lat_eff >  0.02: turn_dir, turn_sign = "右", -1
+        elif lat_eff < -0.02: turn_dir, turn_sign = "左", +1
+        else:                 turn_dir, turn_sign = "中",  0
+
+    if lateral_world is not None and abs(lateral_world) > cfg["ALIGN_LAT"] * 1.5:
+        rotate_hint_deg = -lateral_world * 30.0
+        rotate_hint_deg = max(-15.0, min(15.0, rotate_hint_deg))
+    else:
+        rotate_hint_deg = 0.0
+
+    with _qrnav_pose_lock:
+        img_w = _qrnav_img_w_box[0]
+    fill = _compute_fill_ratio(pose, img_w)
+    zoom_needed = fill < cfg["ZOOM_TARGET"]
+    if zoom_needed and fill > 1e-4:
+        zoom_factor = (cfg["ZOOM_TARGET"] / fill) ** 0.5
+        zoom_factor = min(zoom_factor, 5.0)
+    else:
+        zoom_factor = 1.0
+
+    if "rmat" in pose:
+        rmat = np.array(pose["rmat"], dtype=float)
+        Z_axis = rmat[:, 2]
+        cos_a = float(np.clip(abs(float(Z_axis[2])), -1.0, 1.0))
+        angle_to_plane = float(np.degrees(np.arccos(cos_a)))
+    else:
+        angle_to_plane = 0.0
+
+    if lateral_world is not None and abs(lateral_world) > cfg["ALIGN_LAT"]:
+        step = min(abs(lateral_world), cfg["STEP_LAT"])
+        hint = f"→ 向{turn_dir}横移 {step:.2f}m (基座横偏 {lateral_world:+.3f}m)"
+    elif zoom_needed:
+        lx_str = f"{lateral_world:+.3f}" if lateral_world is not None else "n/a"
+        hint = (f"🔍 需要变倍 {zoom_factor:.2f}x (QR 占比 {fill*100:.1f}% < "
+                f"{cfg['ZOOM_TARGET']*100:.0f}%, 横偏 {lx_str} 已对齐)")
+    else:
+        lx_str = f"{lateral_world:+.3f}" if lateral_world is not None else "n/a"
+        hint = (f"✓ 已对齐 (横偏 {lx_str} ≤ {cfg['ALIGN_LAT']}m, "
+                f"QR 占比 {fill*100:.1f}%, 云台 yaw={gimbal_yaw_deg:.1f}°)")
+
+    return {
+        "ready": True, "distance": dist, "lateral_x": lateral_x,
+        "camera_y": y, "camera_z": z,
+        "lateral_world": lateral_world,
+        "forward_world": forward_world,
+        "gimbal_yaw_deg": gimbal_yaw_deg,
+        "turn_dir": turn_dir, "turn_sign": turn_sign,
+        "rotate_hint_deg": rotate_hint_deg,
+        "fill_ratio": fill, "zoom_needed": zoom_needed, "zoom_factor": zoom_factor,
+        "angle_to_plane": angle_to_plane,
+        "qr_yaw": float(pose.get("yaw", 0.0)),
+        "qr_pitch": float(pose.get("pitch", 0.0)),
+        "decoded": str(pose.get("decoded", "")),
+        "qr_size":      _qr_size_resolved(),
+        "qr_size_src":  ("estimator ✓" if _qr_size_est() else "常量0.12"),
+        "qr_size_pose": float(pose.get("qr_size", 0.0) or 0.0),
+        "hint": hint,
+    }
+
+
+# ============================================================
+#  配置 (V1 全部 + V2 新增 FOV / 中心方向)
+# ============================================================
+_QR_NAV_CFG = {
+    "ALIGN_LAT":      0.10,
+    "STEP_LAT":       0.15,
+    "DOG_MAX_STEP_M": 0.30,
+    "EXEC_MIN_LAT":   0.005,
+    "LATERAL_SIGN":   -1,
+    "YAW_SIGN":       +1,
+    "ZOOM_TARGET":    0.15,
+    "STREAM_SCALE":   0.50,
+    "STREAM_QUALITY": 60,
+    "STREAM_FPS":     8.0,
+    "POSE_POLL_HZ":   4.0,
+    "LIVE_POSE_FPS":  0.0,
+    "LIVE_POSE_EMA":  0.55,
+    "QR_SIZE_M":      0.12,
+    # ── V2 新增: 图像中心换算 ──
+    "FOV_X":          60.0,    # 相机水平 FOV (度, 1x 时), 走 main() args.fov_x 注入
+    # 中心换算符号 (实测反了时一键翻):
+    #   dx>0 = QR 偏右; 想让 QR 回到中心, 云台应该让图像往左移 (target 减小 dx 对应角度)
+    #   默认: yaw 增量 = +dx_px * (fov_x / img_w)   ← "右移相机" 让 QR 居中
+    #         pitch 增量 = -dy_px * (fov_y / img_h)  ← "上抬相机" 让 QR 居中
+    # 若云台协议左右/上下是反的, 把下面两个 -1 翻成 +1
+    "CENTER_YAW_SIGN":   +1,
+    "CENTER_PITCH_SIGN": +1,
+    # 中心换算阈值: 像素偏移小于此值就视为已居中, 不发云台命令
+    "CENTER_DEAD_PX":    4.0,
+}
+
+
+def _encode_qr_panel_jpeg(frame, pose):
+    if frame is None:
+        return None
+    h, w = frame.shape[:2]
+    scale = _QR_NAV_CFG["STREAM_SCALE"]
+    nw, nh = int(w * scale), int(h * scale)
+    if nw > 0 and nh > 0 and (nw, nh) != (w, h):
+        frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_NEAREST)
+
+    if pose is not None:
+        if "image_points" in pose:
+            pts = np.array(pose["image_points"], dtype=int).reshape(-1, 2)
+            if len(pts) == 4:
+                cv2.polylines(frame, [pts], True, (0, 255, 0), 2)
+                cx, cy = int(np.mean(pts[:, 0])), int(np.mean(pts[:, 1]))
+                cv2.line(frame, (cx - 20, cy), (cx + 20, cy), (0, 255, 0), 1)
+                cv2.line(frame, (cx, cy - 20), (cx, cy + 20), (0, 255, 0), 1)
+        cmd = pose_to_command(pose)
+        txt1 = f"d={cmd['distance']:.2f}m  lat={cmd['lateral_x']:+.2f}m"
+        cv2.putText(frame, txt1, (10, 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        txt2 = f"fill={cmd['fill_ratio']*100:.1f}%  yaw={cmd['qr_yaw']:.1f}"
+        cv2.putText(frame, txt2, (10, 52),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        if cmd.get("zoom_needed"):
+            cv2.putText(frame, f"ZOOM {cmd['zoom_factor']:.1f}x",
+                        (10, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+    else:
+        cv2.putText(frame, "no QR", (10, 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 100, 255), 2)
+
+    ok, jpg = cv2.imencode(".jpg", frame,
+                           [cv2.IMWRITE_JPEG_QUALITY,
+                            _QR_NAV_CFG["STREAM_QUALITY"]])
+    return jpg.tobytes() if ok else None
+
+
+def _qrnav_pose_sync_loop(estimator, stop_evt):
+    fps = _QR_NAV_CFG["STREAM_FPS"]
+    interval = 1.0 / max(1.0, fps)
+    next_t = time.time()
+    while not stop_evt.is_set():
+        now = time.time()
+        if now < next_t:
+            time.sleep(max(0.0, next_t - now))
+            continue
+        next_t = now + interval
+        pose = getattr(estimator, "latest_pose_data", None)
+        frame = getattr(estimator, "current_frame", None)
+        img_w = int(frame.shape[1]) if frame is not None else 0
+        img_h = int(frame.shape[0]) if frame is not None else 0
+        with _qrnav_pose_lock:
+            _qrnav_pose_box[0] = pose
+            _qrnav_img_w_box[0] = img_w
+            _qrnav_img_h_box[0] = img_h
+            if pose is not None:
+                fill_disp = _compute_fill_ratio(pose, img_w)
+                _qrnav_pose_msg_box[0] = (
+                    f"距 {pose.get('distance', 0):.2f}m  "
+                    f"占比 {fill_disp*100:.1f}%")
+            _qrnav_pose_ver[0] += 1
+        if frame is not None:
+            jpg = _encode_qr_panel_jpeg(frame, pose)
+            if jpg:
+                _qrnav_jpg_buf.update(jpg)
+
+
+def _qrnav_ascii_tmp(name="_qrnav_live_pose.jpg"):
+    cands = [os.getcwd(),
+             os.environ.get("TEMP", ""), os.environ.get("TMP", ""),
+             tempfile.gettempdir(), "C:\\Windows\\Temp", "D:\\"]
+    for d in cands:
+        if not d:
+            continue
+        p = os.path.join(d, name)
+        if any(ord(c) > 127 for c in p):
+            continue
+        try:
+            os.makedirs(d, exist_ok=True)
+            with open(p, "wb"):
+                pass
+            os.remove(p)
+            return p
+        except Exception:
+            continue
+    return os.path.join(tempfile.gettempdir(), name)
+
+
+def _qrnav_live_pose_loop(estimator, stop_evt):
+    fps = float(_QR_NAV_CFG.get("LIVE_POSE_FPS", 0.0) or 0.0)
+    if fps <= 0:
+        return
+    interval = 1.0 / max(0.2, min(30.0, fps))
+    ema_a = float(_QR_NAV_CFG.get("LIVE_POSE_EMA", 0.55))
+    tmp_path = _qrnav_ascii_tmp("_qrnav_live_pose.jpg")
+    ema_tvec = None
+    ema_pos = None
+    next_t = 0.0
+    while not stop_evt.is_set():
+        now = time.time()
+        if now < next_t:
+            time.sleep(min(0.05, max(0.0, next_t - now)))
+            continue
+        next_t = now + interval
+        try:
+            frame = getattr(estimator, "current_frame", None)
+            if frame is None:
+                continue
+            if getattr(estimator, "_est_busy", False):
+                continue
+            if not cv2.imwrite(tmp_path, np.ascontiguousarray(frame)):
+                continue
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                ok, pd, _ = estimator.estimate_pose_from_image(tmp_path,
+                                                               debug=False)
+            if not ok or pd is None:
+                continue
+            if "tvec" in pd:
+                tv = np.array(pd["tvec"], dtype=float).flatten()
+                ema_tvec = tv if ema_tvec is None else (ema_a * tv + (1 - ema_a) * ema_tvec)
+                pd["tvec"] = ema_tvec.reshape(-1, 1).tolist()
+            if "camera_position" in pd:
+                cp = np.array(pd["camera_position"], dtype=float).flatten()
+                ema_pos = cp if ema_pos is None else (ema_a * cp + (1 - ema_a) * ema_pos)
+                pd["camera_position"] = ema_pos.tolist()
+                pd["distance"] = float(np.linalg.norm(ema_pos))
+            pd["live"] = True
+            try:
+                estimator.latest_pose_data = pd
+            except Exception:
+                pass
+            with _qrnav_pose_lock:
+                _qrnav_pose_box[0] = pd
+                _qrnav_pose_msg_box[0] = f"实时 距 {pd.get('distance', 0):.2f}m"
+                _qrnav_pose_ver[0] += 1
+        except Exception:
+            pass
+    try:
+        os.remove(tmp_path)
+    except Exception:
+        pass
+
+
+# ============================================================
+#  自动驾驶 (与 V1 保持一致, 给 V1 路由用)
+# ============================================================
+def _call_dog_http(action, value=0.0, gait=None, timeout=15.0):
+    """本机 HTTP 回调 /dog/<action> (与参照主页面按钮同一个路由)
+
+    注意: 必须绕过 http_proxy —— 板子上若配了代理, urllib 会把 127.0.0.1
+    也丢给代理, 直接返回「ERR 调狗失败」, 表现就是「一键初始化按了没反应」。
+    """
+    import urllib.request
+    import urllib.parse
+    qs = {"v": value}
+    if gait is not None:
+        qs["gait"] = gait
+    url = f"http://127.0.0.1:{_qrnav_dog_port_holder[0]}/dog/{action}?" + \
+          urllib.parse.urlencode(qs)
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(url, timeout=timeout) as r:
+            return r.read().decode("utf-8", errors="ignore")
+    except Exception as e:
+        return f"ERR 调狗失败: {e}"
+
+
+def _dog_msg_bad(msg):
+    """判断 /dog/* 返回文本是否为失败 (供三步初始化判断是否继续下一步)"""
+    return any(k in (msg or "") for k in ("ERR", "✗", "拒绝", "异常", "未连接"))
+
+
+_qrnav_dog_port_holder = [5003]
+_qrnav_estimator_holder = [None]
+_qrnav_last_init_ts = [0.0]
+_QR_NAV_INIT_COOLDOWN = 2.0        # 6s 太长 → 「再按一次」被拒, 没法停止
+
+# ============================================================
+#  Bug 2 修复: 真实 FOV 缓存 (按 zoom 维度)
+#  旧逻辑: FOV_X/zoom —— 这是经验公式, 实际不同镜头在不同变倍下
+#         焦距-变倍不是严格反比 (尤其带畸变/电动变焦镜头)
+#  新逻辑: 调云台 query_focal_length() 取真实 FOV, 按 zoom 缓存 60s
+#         同步刷新 est.camera_matrix 让后续 PnP 用对的内参
+# ============================================================
+_qrnav_focal_cache       = {}      # zoom(float) -> (fov_x, fov_y, ts)
+_qrnav_focal_cache_ttl   = 60.0    # 秒
+_qrnav_last_known_zoom   = [None]  # 跟踪 zoom 变化, 变了就刷新 camera_matrix
+_qrnav_fov_sensor_w_mm   = 6.17    # IMX415 1/2.8" 感光元件宽, 仅作兜底
+_qrnav_fov_sensor_h_mm   = 4.55    # 感光元件高
+
+
+def _query_real_fov_from_gimbal(timeout=1.5):
+    """调云台 query_focal_length() 拿真实 FOV (度) — 不阻塞, 失败返 None"""
+    est = _qrnav_estimator_holder[0]
+    if est is None:
+        return None
+    gimbal = getattr(est, "gimbal", None)
+    if gimbal is None or not hasattr(gimbal, "query_focal_length"):
+        return None
+    try:
+        import threading as _thr
+        holder = [None]
+        def _do():
+            try:
+                holder[0] = gimbal.query_focal_length()
+            except Exception:
+                pass
+        t = _thr.Thread(target=_do, daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+        if holder[0] is None:
+            return None
+        fov_x, fov_y, fx_mm, fy_mm = holder[0]
+        if fov_x and fov_y and fov_x > 0 and fov_y > 0:
+            return (float(fov_x), float(fov_y), float(fx_mm or 0), float(fy_mm or 0))
+    except Exception:
+        return None
+    return None
+
+
+def _rebuild_camera_matrix(img_w, img_h, fov_x_deg, fov_y_deg):
+    """用真实 FOV 重建 camera_matrix (跟参照主页面 _init_camera 一致)"""
+    est = _qrnav_estimator_holder[0]
+    if est is None or img_w <= 0 or img_h <= 0:
+        return None
+    try:
+        fx = img_w / (2.0 * math.tan(math.radians(fov_x_deg) / 2.0))
+        fy = img_h / (2.0 * math.tan(math.radians(fov_y_deg) / 2.0))
+        cam = np.array([
+            [fx, 0.0, img_w / 2.0],
+            [0.0, fy, img_h / 2.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float64)
+        est.camera_matrix = cam
+        return cam
+    except Exception:
+        return None
+
+
+def _ensure_focal_for_zoom(cur_zoom, img_w, img_h, force_query=False):
+    """按当前 zoom 拿到真实 (fov_x, fov_y), 同步刷新 est.camera_matrix
+
+    优先级:
+      1) cache 命中且未过期 (60s) —— 直接返
+      2) pose.camera_matrix 反算 —— zoom 不变时
+      3) 实时 query gimbal, 缓存并刷 est.camera_matrix
+      4) 退回 FOV_X / zoom 公式 (最后兜底)
+    """
+    cfg = _QR_NAV_CFG
+    est = _qrnav_estimator_holder[0]
+    if est is None or img_w <= 0 or img_h <= 0:
+        fx = float(cfg.get("FOV_X", 60.0))
+        return fx, fx * (img_h / max(1, img_w))
+    cur_zoom = max(1.0, round(float(cur_zoom or 1.0), 2))
+    now = time.time()
+
+    # 1) cache 命中
+    cached = _qrnav_focal_cache.get(cur_zoom)
+    if not force_query and cached and (now - cached[2] < _qrnav_focal_cache_ttl):
+        return cached[0], cached[1]
+
+    # 2) 已有 camera_matrix 且 zoom 没变 —— 用现成 fx 反算
+    last_zoom = _qrnav_last_known_zoom[0]
+    cam = getattr(est, "camera_matrix", None)
+    if (cam is not None and last_zoom == cur_zoom
+            and float(cam[0, 0]) > 0):
+        try:
+            fx = float(cam[0, 0])
+            fov_x = 2.0 * math.degrees(math.atan(
+                _qrnav_fov_sensor_w_mm / (2.0 * fx
+                * (_qrnav_fov_sensor_w_mm / float(img_w)))))
+            # 上面是真实几何; 但 cam 的 fx 是像素单位, 转回 FOV 用 W/2 / fx
+            fov_x = 2.0 * math.degrees(math.atan(float(img_w) / (2.0 * fx)))
+            fy = float(cam[1, 1]) if cam.shape[0] > 1 and cam.shape[1] > 1 else fx
+            fov_y = 2.0 * math.degrees(math.atan(float(img_h) / (2.0 * fy)))
+            _qrnav_focal_cache[cur_zoom] = (fov_x, fov_y, now)
+            return fov_x, fov_y
+        except Exception:
+            pass
+
+    # 3) 实时查云台
+    res = _query_real_fov_from_gimbal()
+    if res is not None:
+        fov_x, fov_y, fx_mm, fy_mm = res
+        _qrnav_focal_cache[cur_zoom] = (fov_x, fov_y, now)
+        # ★ 同步刷新 est.camera_matrix, 让后续 PnP 用对的内参
+        _rebuild_camera_matrix(img_w, img_h, fov_x, fov_y)
+        _qrnav_last_known_zoom[0] = cur_zoom
+        return fov_x, fov_y
+
+    # 4) 兜底: 经验公式
+    fov_x_base = float(cfg.get("FOV_X", 60.0))
+    fov_x = fov_x_base / cur_zoom
+    fov_y = fov_x * (float(img_h) / float(img_w))
+    if force_query:
+        _qrnav_focal_cache[cur_zoom] = (fov_x, fov_y, now)
+    return fov_x, fov_y
+
+
+def _maybe_refresh_camera_matrix(img_w, img_h):
+    """检测 zoom 是否变了, 变了就刷 camera_matrix (PnP 用真内参)"""
+    est = _qrnav_estimator_holder[0]
+    if est is None:
+        return
+    cur_zoom = max(1.0, round(float(getattr(est, "current_zoom_mag", 1.0) or 1.0), 2))
+    last = _qrnav_last_known_zoom[0]
+    if last is None or abs(cur_zoom - last) > 0.05:  # zoom 变了 (5% 容差)
+        _ensure_focal_for_zoom(cur_zoom, img_w, img_h, force_query=False)
+
+
+def _move_lateral_steps(lat, max_step=None):
+    """按完整横偏分段执行, 绕开 0.3m 单次安全锁
+
+    关键改进 (修复「狗原地踏步不前进」+「狗没动」):
+      1) ★ 主动创建 dog 实例: 如果 est._dog 是 None, 直接 new Dog(ip)
+         (旧版走 HTTP 兜底, 受 _http_dog_busy 锁影响, 经常失败)
+      2) ★ 直调 dog.move() 不走 HTTP: 0 锁竞争, 0 代理问题, 实时拿返回值
+      3) ★ 强制 set_gait(0x21010301) 行走 gait (旧代码可能留在踏步 gait)
+      4) 狗未就绪时直调 dog.init() (不再走 HTTP, 3.5s 阻塞但稳)
+    """
+    cfg = _QR_NAV_CFG
+    step = abs(float(lat))
+    lat_eff = float(lat) * cfg.get("LATERAL_SIGN", -1)
+    direction = "right" if lat_eff > 0 else "left"
+    sign = +1 if direction == "left" else -1
+    mx = float(max_step if max_step else
+               cfg.get("DOG_MAX_MOVE_M", 0.30) or 0.30)
+    if mx <= 0:
+        mx = step or 0.30
+    n = int(step // mx)
+    if n * mx < step - 1e-9:
+        n += 1
+    n = max(1, n)
+    per = step / n
+    lock_deg = float(cfg.get("DOG_MAX_TURN_DEG", 30.0) or 30.0)
+
+    # ★ 关键: 主动拿到 dog 实例 (必要时创建)
+    est = _qrnav_estimator_holder[0]
+    if est is None:
+        return ("right", 0.0, 0, 0.0, "✗ estimator 未注入, 没法调狗")
+    dog = getattr(est, "_dog", None)
+    if dog is None:
+        # 优先调 owner._get_dog() (它会按 cfg 拿 IP, 复用同一个 socket)
+        owner = getattr(est, "owner", None) or est
+        if hasattr(owner, "_get_dog"):
+            try:
+                dog = owner._get_dog()
+                print(f"[V2.move] dog 实例未存在, 已通过 owner._get_dog() 主动创建 (ip={getattr(owner, '_dog_ip', '?')})")
+            except Exception as e:
+                return ("right", 0.0, 0, 0.0, f"✗ 创建 dog 实例失败: {e}")
+        else:
+            return ("right", 0.0, 0, 0.0, "✗ dog 实例不存在, 且无 _get_dog() 方法可创建")
+        # 把它挂到 est._dog (让后续 _get_dog_obj 也能拿到)
+        try:
+            est._dog = dog
+        except Exception:
+            pass
+
+    # 1) 狗未就绪: 优先调 stand_quiet (起立+力控, 腿不动, 适合拍 QR 场景)
+    #    1.5+0.5+0.5 = 2.5s 阻塞
+    #    如果 stand_quiet 失败 (狗没在线), 再试 init (带 gait)
+    head = []
+    if not getattr(dog, 'ready', False):
+        try:
+            print("[V2.move] 狗未就绪, 直调 dog.stand_quiet() (起立+手动+力控, 腿不动 ≈2.5s) ...")
+            dog.stand_quiet()
+            head.append("✓ 自动 stand_quiet (起立+力控, 腿不动)")
+        except Exception as e:
+            print(f"[V2.move] stand_quiet 失败: {e}, 改用 dog.init() (带 gait)")
+            try:
+                dog.init()
+                head.append("✓ 自动 init (起立+力控+开始运动)")
+            except Exception as e2:
+                return ("right", 0.0, 0, 0.0,
+                        f"⚠ 横移中止: dog.stand_quiet/init 都失败: {e} / {e2}\n"
+                        f"  → 请检查狗 IP {getattr(est, '_dog_ip', '?')} 是否可达")
+
+    # 2) ★ 关键: 检查 _gait 状态, 不再自动 start_motion / set_gait
+    #    - 用户要求: 在 ① 捕获和 ① 横移之间加「开始运动」按钮, 明确控制
+    #    - 横移前只检查 _gait, 不是行走 gait 就拒绝并提示点「开始运动」
+    #    - 避免自动调 start_motion 失败导致狗没反应
+    cur_gait = getattr(dog, '_gait', None)
+    if cur_gait != 0x21010301:
+        # 未在行走 gait: 提示用户先点「开始运动」按钮
+        print(f"[V2.move] ✗ _gait=0x{cur_gait or 0:08X} 不是行走 gait, 请先按「🏃 开始运动」")
+        return ("right", 0.0, 0, 0.0,
+                f"⚠ 横移中止: 狗未在行走 gait (当前 0x{cur_gait or 0:08X})\n"
+                f"  → 请先按主流程区的「🏃 开始运动」按钮\n"
+                f"  → 走主文件 /dog/motion 路由 (起立+手动+力控+开始运动+踏步 gait)\n"
+                f"  → 然后再按「↔️ ① 执行横移」")
+
+    # 3) 分段调 dog.move()
+    #    ★ 诊断: 入口打印完整 dog 状态, 让用户能复制给我排查
+    diag = [
+        f"  诊断: dog={type(dog).__name__}, addr={getattr(dog, '_addr', '?')}",
+        f"  诊断: ready={getattr(dog, 'ready', '?')}, _ready={getattr(dog, '_ready', '?')}, _gait=0x{getattr(dog, '_gait', 0) or 0:08X}",
+    ]
+    sock = getattr(dog, '_sock', None)
+    if sock is not None:
+        try:
+            diag.append(f"  诊断: socket.getpeername={sock.getpeername()}")
+        except Exception:
+            try:
+                diag.append(f"  诊断: socket.getsockname={sock.getsockname()}")
+            except Exception:
+                diag.append("  诊断: socket 获取地址失败")
+    diag.append(f"  诊断: 横移参数 direction={direction}, sign={sign:+d}, per={per:.3f}m × {n}段, max_move_m={mx}")
+    diag_text = "  ".join(diag)
+    print(f"[V2.move] ========== 横移诊断 ==========")
+    for d in diag: print(f"[V2.move]{d}")
+    print(f"[V2.move] ===================================")
+    move_rets = []
+    for i in range(n):
+        try:
+            print(f"[V2.move]   [{i+1}/{n}] 调 dog.move(y={sign * per:+.3f}, max_move_m={mx}, max_turn_deg={lock_deg})")
+            ok = dog.move(y=sign * per, max_move_m=mx, max_turn_deg=lock_deg)
+            print(f"[V2.move]   [{i+1}/{n}] → 返回 {ok}")
+            if not ok:
+                move_rets.append(f"[{i+1}/{n}] ✗ 被安全锁拒绝 (|y|={per:.2f}m > {mx}m)")
+                break
+            move_rets.append(f"[{i+1}/{n}] ✓ {per:.2f}m 直调")
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            print(f"[V2.move]   [{i+1}/{n}] ✗ dog.move() 异常:\n{tb}")
+            move_rets.append(f"[{i+1}/{n}] ✗ dog.move() 异常: {e}")
+            break
+
+    # ★ 横移完成后: 主动 stop_move (发零速帧), 让腿彻底停下
+    #   避免 gait 循环微抖动影响后续「拍 ②」时的位姿稳定性
+    #   不发 stand_down, 不关 socket, 保持 ready 状态供后续 _dog_ready 用
+    try:
+        dog.stop_move()
+        print("[V2.move] 横移完成, 已 stop_move (零速帧, 腿彻底停)")
+        move_rets.append("✓ stop_move (腿停)")
+    except Exception as e:
+        move_rets.append(f"⚠ stop_move 失败: {e}")
+
+    msg = " | ".join(move_rets)
+    if head:
+        msg = " | ".join(head) + " || " + msg
+    # ★ 诊断信息也拼到返回, 浏览器页面能看到 (用户能复制给我)
+    msg = msg + "\n" + diag_text
+    return direction, step, n, per, msg
+
+
+# ============================================================
+#  V2 新增: 两段式状态机
+# ============================================================
+#  状态字段:
+#    phase            : "idle" | "first_captured" | "first_executed"
+#                    | "dog_ready" | "second_captured" | "done"
+#    first_pose       : dict | None   第一次捕获的 pose_data
+#    second_pose      : dict | None   第二次捕获的 pose_data
+#    first_capture_msg: str           ① 捕获结果文本
+#    first_exec_msg   : str           ① 执行结果文本
+#    second_capture_msg: str          ② 捕获结果文本
+#    second_exec_msg  : str           ② 执行结果文本
+#    first_capture_ts : float         ① 捕获时间戳
+#    second_capture_ts: float         ② 捕获时间戳
+_TWO_PHASE_STATE = {
+    "phase":             "idle",
+    "first_pose":        None,
+    "second_pose":       None,
+    "first_capture_msg": "",
+    "first_exec_msg":    "",
+    "second_capture_msg":"",
+    "second_exec_msg":   "",
+    "first_capture_ts":  0.0,
+    "second_capture_ts": 0.0,
+    "last_update_ts":    0.0,
+}
+_TWO_PHASE_LOCK = threading.Lock()
+
+
+def _phase_get():
+    """返回状态快照 (供前端轮询) — 屏蔽不可序列化的 pose 对象"""
+    with _TWO_PHASE_LOCK:
+        s = dict(_TWO_PHASE_STATE)
+        # 提取概要字段 (避免发送整张 image_points 等大数据)
+        s["first_pose_summary"]  = _pose_summary(s.get("first_pose"))
+        s["second_pose_summary"] = _pose_summary(s.get("second_pose"))
+        # 内部 dict 不外发
+        s.pop("first_pose", None)
+        s.pop("second_pose", None)
+        return s
+
+
+def _pose_summary(pose):
+    """把 pose_data 压缩成 5 个关键数字 + 1 个变倍建议, 供 UI 显示"""
+    if pose is None:
+        return None
+    try:
+        with _qrnav_pose_lock:
+            _qrnav_pose_box[0] = pose   # 让 pose_to_command 走当前 pose
+        cmd = pose_to_command(pose)
+        return {
+            "lateral_world":  cmd.get("lateral_world"),
+            "forward_world":  cmd.get("forward_world"),
+            "fill_ratio":     cmd.get("fill_ratio"),
+            "qr_size":        cmd.get("qr_size"),
+            "gimbal_yaw_deg": cmd.get("gimbal_yaw_deg"),
+            "distance":       cmd.get("distance"),
+            "hint":           cmd.get("hint"),
+        }
+    except Exception:
+        return None
+
+
+def _phase_set(**kw):
+    with _TWO_PHASE_LOCK:
+        for k, v in kw.items():
+            _TWO_PHASE_STATE[k] = v
+        _TWO_PHASE_STATE["last_update_ts"] = time.time()
+
+
+def _phase_reset():
+    with _TWO_PHASE_LOCK:
+        for k in list(_TWO_PHASE_STATE.keys()):
+            if k == "phase":
+                _TWO_PHASE_STATE[k] = "idle"
+            elif k == "last_update_ts":
+                _TWO_PHASE_STATE[k] = time.time()
+            else:
+                _TWO_PHASE_STATE[k] = (0.0 if k.endswith("_ts") else
+                                        (None if k.endswith("_pose") else ""))
+
+
+# ── 统一的『多帧采集』底层 (两次捕获都调这个) ──
+def _do_capture_once(phase_name):
+    """两次捕获的底层算法 (完全相同): 触发多帧采集 + 同步结果到全局 pose_box
+
+    Returns:
+        (ok, pose_data, msg) — ok=False 时 pose 可能仍为 None
+    """
+    est = _qrnav_estimator_holder[0]
+    if est is None:
+        return False, None, "✗ estimator 未注入"
+    frame = getattr(est, "current_frame", None)
+    if frame is None:
+        return False, None, "✗ 无视频帧 (视频流未启动 / 还没收到帧)"
+    if getattr(est, "_est_busy", False):
+        return False, None, "⏳ 上一次采集还没跑完, 请稍等"
+    # ★ Bug 2 修复: 变倍后刷新 camera_matrix, 让本次 PnP 用真内参
+    try:
+        _maybe_refresh_camera_matrix(int(frame.shape[1]), int(frame.shape[0]))
+    except Exception:
+        pass
+    try:
+        est._start_estimate_async(frame)
+    except Exception as e:
+        return False, None, f"✗ 触发失败: {e}"
+    time.sleep(0.3)
+    t0 = time.time()
+    while time.time() - t0 < 15.0:
+        if not getattr(est, "_est_busy", False):
+            break
+        time.sleep(0.1)
+    pd = getattr(est, "latest_pose_data", None)
+    if pd is None:
+        return False, None, "✗ 估计失败 (未检测到 QR / 位姿解算失败)"
+    with _qrnav_pose_lock:
+        _qrnav_pose_box[0] = pd
+        _qrnav_pose_ver[0] += 1
+    cmd = pose_to_command(pd)
+    # ★ Bug 修复: cmd 字典没有 'qr_size' 字段, 直接用 None 格式化会抛 TypeError
+    #   用 (cmd.get(...) or 0) 兜底, 让 msg 字符串必能生成
+    qr_size_val = _qr_size_est() or 0.0
+    lat_val  = cmd.get('lateral_world')
+    fwd_val  = cmd.get('forward_world')
+    fill_val = cmd.get('fill_ratio') or 0.0
+    yaw_val  = cmd.get('gimbal_yaw_deg')
+    lat_str  = f"{lat_val:+.3f}m"  if lat_val  is not None else "--"
+    fwd_str  = f"{fwd_val:.2f}m"   if fwd_val  is not None else "--"
+    yaw_str  = f"{yaw_val:.1f}°"   if yaw_val  is not None else "--"
+    msg = (f"✓ {phase_name} 捕获成功: 横偏 {lat_str}, "
+           f"前距 {fwd_str}, "
+           f"占比 {fill_val*100:.1f}%, "
+           f"QR尺寸 {qr_size_val:.3f}m, "
+           f"yaw={yaw_str}")
+    return True, pd, msg
+
+
+def first_capture_once():
+    """① 第一次捕获: 触发多帧采集, 保存到 first_pose
+
+    与第二次的区别: 仅『存数据』, 不动云台, 不动狗
+    """
+    with _TWO_PHASE_LOCK:
+        phase = _TWO_PHASE_STATE["phase"]
+    # 允许从 idle / 任何非执行中阶段重抓 (用户能自由重拍)
+    if phase in ("first_executed", "dog_ready", "second_captured", "done"):
+        return (f"⚠ 当前阶段 {phase}, 若想重新 ① 捕获请先 ↺ 重置")
+    ok, pd, msg = _do_capture_once("① 第一次")
+    if not ok:
+        return msg
+    _phase_set(phase="first_captured",
+               first_pose=pd,
+               first_capture_msg=msg,
+               first_capture_ts=time.time())
+    return msg
+
+
+def second_capture_once():
+    """② 第二次捕获: 触发多帧采集, 保存到 second_pose
+
+    底层算法与第一次完全相同; 区别只是『保存到 second_pose + 状态推进』
+    """
+    with _TWO_PHASE_LOCK:
+        phase = _TWO_PHASE_STATE["phase"]
+    if phase not in ("dog_ready", "first_executed"):
+        return (f"✗ 当前阶段 {phase}, 应先完成 ① (捕获→横移→标记狗就位)")
+    ok, pd, msg = _do_capture_once("② 第二次")
+    if not ok:
+        return msg
+    _phase_set(phase="second_captured",
+               second_pose=pd,
+               second_capture_msg=msg,
+               second_capture_ts=time.time())
+    return msg
+
+
+def mark_dog_ready():
+    """✓ 标记: 狗已就位 (一般由 exec_phase1_lateral 自动推进, 这按钮是兜底)"""
+    with _TWO_PHASE_LOCK:
+        phase = _TWO_PHASE_STATE["phase"]
+    if phase == "dog_ready":
+        return "✓ 已就绪 (跳过, 无需重复标记)"
+    if phase != "first_executed":
+        return f"✗ 当前阶段 {phase}, 应先完成 ① 捕获 + 横移"
+    _phase_set(phase="dog_ready")
+    return "✓ 已标记: 狗就位 → 可按 ② 第二次捕获"
+
+
+def reset_phase():
+    """↺ 重置: 清空所有阶段, 回到 idle"""
+    _phase_reset()
+    return "✓ 已重置: 回到阶段 0 (idle)"
+
+
+# ============================================================
+#  一键全流程 (▶ 后台线程跑完整 6 段, 实时更新状态给前端轮询)
+#  把原来 6 次手动点击 → 1 次, 前端轮询 /qr_nav2/auto_full_status
+#  即可看到当前步骤 / 进度 / 状态文本
+# ============================================================
+_qrnav_auto_full_status = [None]   # {running, stage, msg, pct, ts}
+
+def _set_af_status(running, stage, msg, pct):
+    _qrnav_auto_full_status[0] = {
+        "running": running, "stage": stage, "msg": msg, "pct": pct,
+        "ts": time.time()
+    }
+
+def _is_af_running():
+    s = _qrnav_auto_full_status[0]
+    return s is not None and s.get("running", False)
+
+def _is_phase_ok(msg):
+    return bool(msg) and ("ERR" not in msg) and ("✗" not in msg)
+
+def _auto_full_worker():
+    """后台线程: 跑完整 6 段流程, 每步更新 _qrnav_auto_full_status"""
+    try:
+        # 0) 初始化狗 (如未就绪)
+        if not _is_dog_fully_ready():
+            _set_af_status(True, "init", "🦿 0/6 初始化狗 (起立+力控+开始运动) ...", 5)
+            ok, msg = _ensure_dog_ready(force_init=True)
+            if not ok:
+                _set_af_status(False, "error", f"✗ 狗初始化失败: {msg}", -1)
+                return
+        else:
+            _set_af_status(True, "init", "✓ 0/6 狗已就绪, 跳过初始化", 5)
+
+        # 1) 第一次捕获
+        _set_af_status(True, "capture1", "📸 1/6 第一次捕获 (多帧+PnP, 约 3-5 秒) ...", 20)
+        msg = first_capture_once()
+        if not _is_phase_ok(msg):
+            _set_af_status(False, "error", f"✗ 第一次捕获失败: {msg}", -1)
+            return
+
+        # 2) 执行横移 (auto-mark dog_ready 在 exec_phase1_lateral 内部完成)
+        _set_af_status(True, "lateral", "↔️ 2/6 执行横移 (狗对齐 QR 中线) ...", 40)
+        msg = exec_phase1_lateral()
+        if not _is_phase_ok(msg):
+            _set_af_status(False, "error", f"✗ 横移失败: {msg}", -1)
+            return
+
+        # 3) 等待 2 秒让狗稳定停下 (避免第二次捕获时还在动)
+        for i in range(4):
+            time.sleep(0.5)
+            _set_af_status(True, "settle", f"⏸ 3/6 等待狗稳定 ({i+1}/4 × 0.5s) ...", 55 + i * 2)
+
+        # 4) 第二次捕获
+        _set_af_status(True, "capture2", "📸 4/6 第二次捕获 (底层算法同①) ...", 65)
+        msg = second_capture_once()
+        if not _is_phase_ok(msg):
+            _set_af_status(False, "error", f"✗ 第二次捕获失败: {msg}", -1)
+            return
+
+        # 5) 云台+变倍
+        _set_af_status(True, "gimbal_zoom", "🔄 5/6 云台+变倍 (QR 拉回中心 + 变倍) ...", 85)
+        msg = exec_phase2_gimbal_zoom()
+        if not _is_phase_ok(msg):
+            _set_af_status(False, "error", f"✗ 云台+变倍失败: {msg}", -1)
+            return
+
+        _set_af_status(False, "done", "✓ 6/6 全流程完成 (狗就位 + QR 居中 + 变倍)", 100)
+    except Exception as e:
+        _set_af_status(False, "error", f"✗ ERR {e}", -1)
+
+
+def exec_phase1_lateral():
+    """① 执行横移: 基于 first_pose, 调狗横移, 不动云台
+
+    ★ 设计: 只算 1 次 pose (在「📸 第一次捕获」时), 横移直接用这个 pose
+      - 用户要求: ① 按钮只做 capture+pose, ↔️ 按钮只做横移 (职责分开)
+      - 不再每次横移都重新 capture, 避免延迟 / 重复计算
+      - 兜底: pose 为空时让用户去按 ① 第一次捕获
+    成功完成后自动推进到 dog_ready (狗.move() 阻塞, 返回时已物理停止)。
+    """
+    with _TWO_PHASE_LOCK:
+        phase = _TWO_PHASE_STATE["phase"]
+        pose = _TWO_PHASE_STATE["first_pose"]
+
+    if phase == "idle":
+        return f"✗ 当前阶段 {phase}, 应先按 📸 ① 第一次捕获 (算 pose, 约 3 秒)"
+    if pose is None:
+        return f"✗ first_pose 为空 (phase={phase}), 请先按 📸 ① 第一次捕获"
+
+    # 用 (已存) pose 算横偏, 不重抓不重算
+    with _qrnav_pose_lock:
+        _qrnav_pose_box[0] = pose
+    cmd = pose_to_command(pose)
+    lat = cmd.get("lateral_world")
+    if lat is None:
+        return "✗ 横偏数值未就绪 (基座投影失败)"
+
+    dead = float(_QR_NAV_CFG.get("EXEC_MIN_LAT", 0.005))
+    if abs(lat) <= dead:
+        msg = (f"✓ ① 横偏 x={lat:+.3f}m ≤ {dead}m 已对齐, 无需移动  "
+               f"(来源=base, 原始 base_x={lat})")
+    else:
+        direction, step, n, per, ret = _move_lateral_steps(lat)
+        seg = (f"分{n}段×{per:.2f}m" if n > 1 else f"单段{per:.2f}m")
+        msg = (f"✓ ① 横移 {step:.2f}m 向{direction} ({seg}) | {ret}  "
+               f"(基座横偏 {lat:+.3f}m)")
+
+    # ★ auto-advance: 横移完成 = 狗物理停止 = dog_ready
+    _phase_set(phase="dog_ready", first_exec_msg=msg)
+    return msg
+
+
+def _compute_gimbal_center_offset(pose, img_w, img_h):
+    """根据 QR 在图像中的位置, 计算让 QR 居中所需的云台 yaw/pitch 增量 (度)
+
+    推导:
+      图像中心   = (img_w/2, img_h/2)
+      QR 中心     = image_points 4 角均值
+      像素偏移   = (qr_cx - img_w/2, qr_cy - img_h/2)
+      当前 FOV   = FOV_X / zoom (横向), FOV_Y / zoom (纵向)
+                   FOV_Y 按宽高比推 (FOV_X * h / w)
+      角速度     = 1 像素 ≈ (FOV / 边长) 度
+      yaw 增量   = +dx_px * (cur_fov_x / img_w) * sign_yaw
+        QR 偏右 → dx>0 → 若 sign=+1, 云台 + yaw (相机右转, 把 QR 带回中心)
+      pitch 增量 = -dy_px * (cur_fov_y / img_h) * sign_pitch
+        QR 偏下 → dy>0 → 若 sign=+1, -dy → 云台 - pitch (相机上抬, 把 QR 带回中心)
+
+    Returns:
+        (yaw_offset_deg, pitch_offset_deg, cur_fov_x, cur_fov_y, qr_cx, qr_cy)
+    """
+    cfg = _QR_NAV_CFG
+    if img_w <= 0 or img_h <= 0:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    est = _qrnav_estimator_holder[0]
+    cur_zoom = float(getattr(est, "current_zoom_mag", 1.0) or 1.0)
+    cur_zoom = max(1.0, cur_zoom)
+    # ★ Bug 2 修复: 不用经验公式, 拉真实 FOV (按 zoom 缓存 60s)
+    cur_fov_x, cur_fov_y = _ensure_focal_for_zoom(
+        cur_zoom, int(img_w), int(img_h), force_query=False)
+    img_pts = pose.get("image_points")
+    if img_pts is None or len(img_pts) < 4:
+        return 0.0, 0.0, cur_fov_x, cur_fov_y, img_w / 2.0, img_h / 2.0
+    pts = np.asarray(img_pts, dtype=float).reshape(-1, 2)
+    qr_cx, qr_cy = float(pts[:, 0].mean()), float(pts[:, 1].mean())
+    dx_px = qr_cx - img_w / 2.0
+    dy_px = qr_cy - img_h / 2.0
+    sign_y   = float(cfg.get("CENTER_YAW_SIGN",   +1))
+    sign_p   = float(cfg.get("CENTER_PITCH_SIGN", +1))
+    yaw_off   =  sign_y * dx_px * (cur_fov_x / float(img_w))
+    pitch_off = -sign_p * dy_px * (cur_fov_y / float(img_h))
+    return float(yaw_off), float(pitch_off), cur_fov_x, cur_fov_y, qr_cx, qr_cy
+
+
+def exec_phase2_gimbal_zoom():
+    """② 执行云台+变倍: 基于 second_pose, 旋转云台到图像中心 + 按需变倍
+
+    这是 V2 关键变化:
+      - 第一次执行只动狗, 不动云台
+      - 第二次执行才让云台把 QR 转到画面中心
+      - 变倍仍按 fill_ratio 走 V1 公式
+    """
+    with _TWO_PHASE_LOCK:
+        phase = _TWO_PHASE_STATE["phase"]
+        pose = _TWO_PHASE_STATE["second_pose"]
+    if phase != "second_captured":
+        return f"✗ 当前阶段 {phase}, 应先按 ② 第二次捕获"
+    if pose is None:
+        return "✗ 第二次 pose 为空"
+
+    est = _qrnav_estimator_holder[0]
+    gimbal = getattr(est, "gimbal", None) if est else None
+    if gimbal is None:
+        return "✗ 云台未就绪 (gimbal 句柄为空)"
+
+    frame = getattr(est, "current_frame", None)
+    if frame is None:
+        return "✗ 无视频帧 (无法算图像尺寸 / 中心)"
+    img_h, img_w = frame.shape[:2]
+
+    yaw_off, pitch_off, fov_x, fov_y, qr_cx, qr_cy = \
+        _compute_gimbal_center_offset(pose, img_w, img_h)
+
+    # 死区: 像素偏移 < CENTER_DEAD_PX 就不动云台
+    dead_px = float(_QR_NAV_CFG.get("CENTER_DEAD_PX", 4.0))
+    dx_px = qr_cx - img_w / 2.0
+    dy_px = qr_cy - img_h / 2.0
+
+    msgs = []
+    if abs(dx_px) < dead_px and abs(dy_px) < dead_px:
+        msgs.append(f"✓ QR 已居中 (dx={dx_px:+.1f}px, dy={dy_px:+.1f}px, "
+                    f"死区 {dead_px}px) — 云台无需旋转")
+    else:
+        # 限幅: 单次增量不超过当前 FOV/2
+        yaw_off   = max(-fov_x / 2.0, min(fov_x / 2.0, yaw_off))
+        pitch_off = max(-fov_y / 2.0, min(fov_y / 2.0, pitch_off))
+        try:
+            cur_yaw, cur_pitch, _ = gimbal.get_current_angles()
+        except Exception:
+            cur_yaw, cur_pitch = 0.0, 0.0
+        target_yaw   = max(-180.0, min(180.0, cur_yaw + yaw_off))
+        target_pitch = max(-90.0,  min(90.0,  cur_pitch + pitch_off))
+        try:
+            est._gimbal_rotate(target_yaw, target_pitch, 0.0)
+        except Exception as e:
+            return f"✗ 云台旋转失败: {e}"
+        msgs.append(
+            f"🔄 云台 yaw {cur_yaw:.1f}°→{target_yaw:.1f}° "
+            f"pitch {cur_pitch:.1f}°→{target_pitch:.1f}° "
+            f"(增量 {yaw_off:+.2f}°/{pitch_off:+.2f}°, FOV_x={fov_x:.1f}°, "
+            f"QR 偏 {dx_px:+.1f}px/{dy_px:+.1f}px)")
+
+    # 变倍 (按需)
+    with _qrnav_pose_lock:
+        _qrnav_pose_box[0] = pose
+    cmd = pose_to_command(pose)
+    fill = cmd.get("fill_ratio") or 0.0
+    if fill > 1e-4 and fill < _QR_NAV_CFG["ZOOM_TARGET"]:
+        cur_z = getattr(est, "current_zoom_mag", 1.0)
+        k = (_QR_NAV_CFG["ZOOM_TARGET"] / fill) ** 0.5
+        zmin = getattr(est, "_zoom_min", 1.0)
+        zmax = getattr(est, "_zoom_max", 30.0)
+        target_z = max(zmin, min(zmax, cur_z * k))
+        try:
+            gimbal.zoom_to_magnification(target_z)
+            est.current_zoom_mag = target_z
+            msgs.append(f"🔍 变倍 {cur_z:.1f}x→{target_z:.1f}x "
+                        f"(fill {fill*100:.1f}%→"
+                        f"{_QR_NAV_CFG['ZOOM_TARGET']*100:.0f}%)")
+        except Exception as e:
+            msgs.append(f"⚠ 变倍失败: {e}")
+    else:
+        msgs.append(f"🔍 变倍 OK (fill {fill*100:.1f}%)")
+
+    msg = " | ".join(msgs)
+    _phase_set(phase="done", second_exec_msg=msg)
+    return msg
+
+
+# ============================================================
+#  V1 用的辅助 (一键初始化 / 狗状态) — V2 同样用
+# ============================================================
+def _get_dog_obj():
+    est = _qrnav_estimator_holder[0]
+    if est is None:
+        return None
+    return getattr(est, "_dog", None)
+
+
+def _init_dog_3steps():
+    """起立 + 力控 + 开始运动 —— 与参照主页面 ① 起立 → ② 力控 → ③ 开始运动 等价
+
+    关键: 三步必须都真的下发, 否则「狗腿不动」或「移动指令被运控丢弃」。
+    旧实现用 _is_dog_fully_ready() 一读 True 就提前 return (只发了 stand),
+    这是 V2 页面点「一键初始化」后狗不原地踏步的直接原因。
+    """
+    now = time.time()
+    elapsed = now - _qrnav_last_init_ts[0]
+    if elapsed < _QR_NAV_INIT_COOLDOWN:
+        return (f"⏳ 冷却中 (距上次初始化 {elapsed:.1f}s < "
+                f"{_QR_NAV_INIT_COOLDOWN:.1f}s), 请稍候再按")
+    _qrnav_last_init_ts[0] = now
+    msgs = []
+    # ① 起立 (心跳+起立+手动+力控+开始运动+gait, 约 3.5s)
+    r = _call_dog_http("stand", value=0.0)
+    msgs.append(f"① 起立: {r}")
+    if _dog_msg_bad(r):
+        return " | ".join(msgs)
+    # ② 力控 (缺它 → 移动指令被运控丢弃)
+    r = _call_dog_http("force", value=0.0)
+    msgs.append(f"② 力控: {r}")
+    if _dog_msg_bad(r):
+        return " | ".join(msgs)
+    # ③ 开始运动 + gait 0x21010301 (缺它 → 狗腿不动 / 原地踏步不前进)
+    r = _call_dog_http("motion", value=0.0, gait=0x21010301)
+    msgs.append(f"③ 开始运动: {r}")
+    if _dog_msg_bad(r):
+        return " | ".join(msgs)
+    return " | ".join(msgs) + " ✓ 三步完成, 狗应原地踏步"
+
+
+def _get_dog_step_state():
+    """狗的三步使能状态 (供页面指示灯 + 「一键初始化/停止」切换判断)
+
+    判定优先级:
+      1) estimator 里的 Dog 实例 (Dog._ready) —— 最准
+      2) 退回读 /dog_msg 文本 —— 注意「✓ 已停止并趴下复位 / 趴下 / 阻尼」
+         必须判为「未就绪」, 否则停止后会误显示为「已就绪」, 切换按钮卡死
+    """
+    state = {"stand": False, "force": False, "motion": False, "ready": False}
+    dog = _get_dog_obj()
+    if dog is not None:
+        if bool(getattr(dog, "ready", False)):
+            state["stand"] = state["force"] = state["motion"] = True
+            state["ready"] = True
+        return state
+    try:
+        import urllib.request
+        url = f"http://127.0.0.1:{_qrnav_dog_port_holder[0]}/dog_msg"
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(url, timeout=1) as r:
+            msg = r.read().decode("utf-8", errors="ignore").strip()
+    except Exception:
+        return state
+    if msg == "" or "未连接" in msg:
+        return state
+    # 停止 / 趴下 / 阻尼 / 断开 之后一律视为「未就绪」
+    if any(k in msg for k in ("停止", "趴下", "阻尼", "断开")):
+        return state
+    state["stand"] = state["force"] = state["motion"] = True
+    state["ready"] = True
+    return state
+
+
+def _is_dog_fully_ready():
+    try:
+        return _get_dog_step_state().get("motion", False)
+    except Exception:
+        return False
+
+
+def _ensure_dog_ready(force_init=False):
+    if not force_init and _is_dog_fully_ready():
+        return True, "狗已就绪"
+    msg = _init_dog_3steps()
+    if "ERR" in msg or "失败" in msg:
+        return False, msg
+    if "冷却" in msg:
+        return _is_dog_fully_ready(), msg
+    return True, msg
+
+
+# ============================================================
+#  V1 路由函数 (保留, /qr_nav 走原版, /qr_nav2 走 V2 状态机)
+# ============================================================
+def lateral_step_only():
+    cfg = _QR_NAV_CFG
+    with _qrnav_pose_lock:
+        pose = _qrnav_pose_box[0]
+    if pose is None:
+        return ("✗ 横偏数值未就绪: 暂无 QR 帧")
+    cmd = pose_to_command(pose)
+    lat_g  = cmd.get("lateral_world")
+    lat_x  = cmd.get("lateral_x")
+    fwd    = cmd.get("forward_world")
+    yaw    = cmd.get("gimbal_yaw_deg")
+    fill   = cmd.get("fill_ratio") or 0.0
+    qr_s   = cmd.get("qr_size") or 0.0
+    if lat_g is not None:
+        lat, src = float(lat_g), "base"
+    elif lat_x is not None:
+        lat, src = -float(lat_x), "fallback"
+    else:
+        return (f"✗ 横偏数值未就绪: base_x=None, camera_x=None")
+    fwd_str = f"{fwd:.2f}m" if fwd is not None else "n/a"
+    dead = float(cfg.get("EXEC_MIN_LAT", 0.005))
+    extra = (f"(来源={src}, base_x={lat_g}, camera_x={lat_x}, "
+             f"yaw={yaw or 0:.1f}°, 前距 {fwd_str}, "
+             f"fill={fill*100:.1f}%, qr_size={qr_s:.3f}m)")
+    if abs(lat) <= dead:
+        return (f"✓ 横偏 x={lat:+.3f}m ≤ {dead}m 已接近 0, 无需移动  {extra}")
+    direction, step, n, per, ret = _move_lateral_steps(lat)
+    if n > 1:
+        seg = (f"分{n}段×{per:.2f}m "
+               f"(绕开参照单次 {cfg.get('DOG_MAX_STEP_M', 0.3)}m 安全锁)")
+    else:
+        seg = f"单段 {per:.2f}m"
+    return (f"✓ 横移 {step:.2f}m 向{direction} | {seg} | {ret}  {extra}")
+
+
+def zoom_step_only():
+    cfg = _QR_NAV_CFG
+    with _qrnav_pose_lock:
+        pose = _qrnav_pose_box[0]
+    if pose is None:
+        return "✗ 变倍数值未就绪: 暂无 QR 帧"
+    cmd = pose_to_command(pose)
+    fill  = cmd.get("fill_ratio") or 0.0
+    qr_s  = cmd.get("qr_size") or 0.0
+    yaw   = cmd.get("gimbal_yaw_deg")
+    fwd   = cmd.get("forward_world")
+    est   = _qrnav_estimator_holder[0]
+    cur_z = getattr(est, "current_zoom_mag", 1.0) if est else 1.0
+    if fill <= 1e-4:
+        return (f"✗ 无法算变倍数值: QR 占比 fill=0")
+    if fill >= cfg["ZOOM_TARGET"]:
+        return (f"✓ 无需变倍: QR 占比 {fill*100:.1f}% ≥ "
+                f"{cfg['ZOOM_TARGET']*100:.0f}% (当前 {cur_z:.1f}x)")
+    if est is None or getattr(est, "gimbal", None) is None:
+        return (f"✗ 无云台句柄, 无法变倍")
+    k = (cfg["ZOOM_TARGET"] / fill) ** 0.5
+    zmin = getattr(est, "_zoom_min", 1.0)
+    zmax = getattr(est, "_zoom_max", 30.0)
+    target = max(zmin, min(zmax, cur_z * k))
+    est.gimbal.zoom_to_magnification(target)
+    est.current_zoom_mag = target
+    return (f"变倍数值 {cur_z:.1f}x → {target:.1f}x "
+            f"(QR 占比 {fill*100:.1f}% → 目标 {cfg['ZOOM_TARGET']*100:.0f}%)")
+
+
+# ============================================================
+#  V1 兼容函数 (V2 页面也用: 自动一步 / 仅横向对齐 / 一键执行)
+#  把 V1 的 auto/align/exec_plan 算法并到 V2, 这样 V2 页面就能独立完成
+#  所有"机器人运动"操作, 不必再切回 V1 页面
+# ============================================================
+def _auto_zoom_step(fill):
+    """V1 风格: 按当前 fill_ratio 自动变倍一次 (云台给的 fill → 目标倍率)"""
+    cfg = _QR_NAV_CFG
+    est = _qrnav_estimator_holder[0]
+    if est is None or getattr(est, "gimbal", None) is None:
+        return f"🔍 需变倍 (fill {fill*100:.1f}% < {cfg['ZOOM_TARGET']*100:.0f}%, 无云台句柄)"
+    cur_z = getattr(est, "current_zoom_mag", 1.0)
+    if fill < 1e-4:
+        return "🔍 需变倍 (fill=0, 无法算倍率)"
+    k = (cfg["ZOOM_TARGET"] / fill) ** 0.5
+    zmin = getattr(est, "_zoom_min", 1.0)
+    zmax = getattr(est, "_zoom_max", 30.0)
+    target = max(zmin, min(zmax, cur_z * k))
+    est.gimbal.zoom_to_magnification(target)
+    est.current_zoom_mag = target
+    return f"🔍 变倍→{target:.1f}x (fill {fill*100:.1f}% → {cfg['ZOOM_TARGET']*100:.0f}%)"
+
+
+def auto_step_nav():
+    """V1 风格: 自动一步 (横移 + 变倍 串行)
+
+    与 V2 的 6 段式不同 — 这是一键 (用最近一次 pose, 不重新捕获)
+    """
+    cfg = _QR_NAV_CFG
+    with _qrnav_pose_lock:
+        pose = _qrnav_pose_box[0]
+    if pose is None:
+        return "无 QR 数据, 跳过"
+    cmd = pose_to_command(pose)
+    if not cmd["ready"]:
+        return "无 QR 数据, 跳过"
+    lat  = cmd["lateral_world"]
+    fwd  = cmd["forward_world"]
+    yaw  = cmd["gimbal_yaw_deg"]
+    fill = cmd.get("fill_ratio") or 0.0
+    zoom_needed = cmd.get("zoom_needed", False)
+    if lat is None or fwd is None:
+        return "基座 3D 坐标未就绪"
+
+    abs_lat = abs(lat)
+    if abs_lat > cfg["ALIGN_LAT"]:
+        direction, step, n, per, ret = _move_lateral_steps(lat)
+        seg = f"分{n}段×{per:.2f}m" if n > 1 else f"单段{per:.2f}m"
+        msgs = [f"{cmd['turn_dir']}: 横移 {step:.2f}m ({seg}) "
+                f"(基座横偏 {lat:+.3f}m, 前距 {fwd:.2f}m, "
+                f"yaw={yaw:.1f}°)" + " | " + ret]
+        if zoom_needed:
+            msgs.append(_auto_zoom_step(fill))
+        return " | ".join(msgs)
+    if zoom_needed:
+        return (f"✓ 横偏已对齐 ({lat:+.3f}m ≤ {cfg['ALIGN_LAT']}m) | "
+                + _auto_zoom_step(fill) + " | (前进/旋转请手动按钮)")
+    return (f"✓ 已对齐 (横偏 {lat:+.3f}m ≤ {cfg['ALIGN_LAT']}m, "
+            f"QR 占比 {fill*100:.1f}% ≥ {cfg['ZOOM_TARGET']*100:.0f}%, "
+            f"前距 {fwd:.2f}m, yaw={yaw:.1f}°)")
+
+
+def align_step_nav():
+    """V1 风格: 仅横向对齐 (横移, 不动变倍)"""
+    cfg = _QR_NAV_CFG
+    with _qrnav_pose_lock:
+        pose = _qrnav_pose_box[0]
+    if pose is None:
+        return "无 QR 数据"
+    cmd = pose_to_command(pose)
+    if not cmd["ready"]:
+        return "无 QR 数据"
+    lat = cmd["lateral_world"]
+    yaw = cmd["gimbal_yaw_deg"]
+    if lat is None:
+        return "基座横偏未就绪"
+    dead = float(cfg.get("EXEC_MIN_LAT", 0.005))
+    if abs(lat) <= dead:
+        return (f"✓ 已接近 0 (基座横偏 {lat:+.3f}m ≤ {dead}m, "
+                f"yaw={yaw:.1f}°)")
+    direction, step, n, per, ret = _move_lateral_steps(lat)
+    seg = f"分{n}段×{per:.2f}m" if n > 1 else f"单段{per:.2f}m"
+    return (f"↔ 横移 {step:.2f}m 向{direction} ({seg}) | {ret} "
+            f"(基座横偏 {lat:+.3f}m, yaw={yaw:.1f}°)")
+
+
+def exec_plan_step():
+    """V1 风格: 一次性按 plan 执行横移 + 变倍 (用于前端循环"一键执行")
+
+    V2 中也可用, 但要注意它不触发云台中心对齐 (那是 ② ② 的事)
+    """
+    cfg = _QR_NAV_CFG
+    with _qrnav_pose_lock:
+        pose = _qrnav_pose_box[0]
+    if pose is None:
+        return "无 QR 数据"
+    cmd = pose_to_command(pose)
+    if not cmd.get("ready"):
+        return "无 QR 数据"
+    lat  = cmd.get("lateral_world")
+    fwd  = cmd.get("forward_world")
+    if lat is None or fwd is None:
+        return "基座坐标未就绪"
+    abs_lat = abs(lat)
+    msgs = []
+    if abs_lat > cfg["ALIGN_LAT"]:
+        ld, step, n, per, ret = _move_lateral_steps(lat)
+        seg = f"分{n}段×{per:.2f}m" if n > 1 else f"单段{per:.2f}m"
+        msgs.append(f"↔ 横移 {step:.2f}m 向{ld} ({seg}): " + ret)
+    else:
+        msgs.append(f"✓ 横偏已对齐 ({lat:+.3f}m ≤ {cfg['ALIGN_LAT']}m)")
+    est = _qrnav_estimator_holder[0]
+    if est is not None and getattr(est, "gimbal", None) is not None:
+        fill = cmd.get("fill_ratio") or 0.0
+        cur_z = getattr(est, "current_zoom_mag", 1.0)
+        if fill > 1e-4 and fill < cfg["ZOOM_TARGET"]:
+            k = (cfg["ZOOM_TARGET"] / fill) ** 0.5
+            zmin = getattr(est, "_zoom_min", 1.0)
+            zmax = getattr(est, "_zoom_max", 30.0)
+            target = max(zmin, min(zmax, cur_z * k))
+            est.gimbal.zoom_to_magnification(target)
+            est.current_zoom_mag = target
+            msgs.append(f"🔍 变倍→{target:.1f}x (fill {fill*100:.1f}% → "
+                        f"{cfg['ZOOM_TARGET']*100:.0f}%)")
+        else:
+            msgs.append(f"🔍 变倍 OK (fill {fill*100:.1f}%)")
+    msgs.append(f"前距 {fwd:.2f}m / yaw {cmd.get('gimbal_yaw_deg',0.0):.1f}° "
+                f"(前进/旋转请手动按钮)")
+    return " | ".join(msgs)
+
+
+# ============================================================
+#  HTML — V2 页面 (5 步走, 状态条 + 阶段指示)
+# ============================================================
+HTML_QR_NAV2_PAGE = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>QR → 狗 两段式自动导航 (V2)</title>
+<style>
+  body{font-family:"Microsoft YaHei",sans-serif;margin:0;background:#1a1a1f;color:#eee;padding:8px}
+  h3{margin:4px 0;color:#0cf;font-size:14px}
+  a{color:#0cf}
+  .row{display:flex;flex-wrap:wrap;gap:8px}
+  .panel{background:#26262e;border-radius:5px;padding:8px;flex:1;min-width:300px}
+  .vid{position:relative;background:#000;border:1px solid #444}
+  .vid img{display:block;width:480px;height:auto}
+  .vid .overlay{position:absolute;top:4px;left:4px;background:rgba(0,0,0,0.6);
+                padding:3px 6px;font:11px monospace;color:#0f0;border-radius:3px}
+  .stepbar{display:flex;gap:0;margin:8px 0;align-items:center}
+  .step{flex:1;background:#333;color:#aaa;padding:10px 6px;text-align:center;
+        border-right:1px solid #111;font-size:12px}
+  .step:last-child{border-right:0}
+  .step.active{background:#0af;color:#fff;font-weight:bold}
+  .step.done{background:#0a0;color:#000}
+  .step.cur{background:#0cf;color:#000;font-weight:bold}
+  .arrow{color:#888;font-size:18px;padding:0 4px}
+  .pose{font-family:Consolas,monospace;font-size:12px;line-height:1.6}
+  .pose b{color:#0cf;display:inline-block;min-width:90px}
+  .ok{color:#0f0}.warn{color:#f80}.err{color:#f44}
+  button{padding:7px 12px;margin:2px;border:none;border-radius:3px;cursor:pointer;
+         background:#0af;color:#fff;font-size:12px;font-weight:bold}
+  button:hover{background:#08d}
+  button:disabled{background:#555;cursor:not-allowed;color:#aaa}
+  button.danger{background:#c33}
+  button.success{background:#0a0;color:#000}
+  button.warn{background:#f80;color:#222}
+  .btn-block{width:100%;font-size:13px;padding:10px}
+  .row2{margin:3px 0}
+  .grid{display:grid;grid-template-columns:repeat(3,46px);gap:3px;margin:4px 0}
+  .hint{color:#bbb;font-size:11px;margin:2px 0;padding:4px;background:#333;border-radius:3px}
+  .summary{background:#00263a;border:1px solid #0ff;padding:6px;margin:4px 0;
+           font-family:Consolas,monospace;font-size:12px;line-height:1.5}
+  .log{background:#1a1a1a;border:1px solid #444;padding:6px;margin-top:6px;
+       font-family:Consolas,monospace;font-size:11px;line-height:1.5;
+       max-height:200px;overflow-y:auto;color:#0f0}
+  .log .err{color:#f44}
+  .log .warn{color:#f80}
+  .log .ok{color:#0f0}
+  /* ── 机器狗控制盘 (与参照主页面同款) ── */
+  .btn-dog{background:#555;color:#fff}
+  .btn-dog:hover{background:#777}
+  .btn-dogm{background:#0a6;color:#fff;font-size:13px}
+  .btn-dogm:hover{background:#0c8}
+  .btn-dogm:disabled{background:#444;color:#888}
+  .msg{background:#111;border:1px solid #555;padding:5px;margin-top:5px;
+       font-family:Consolas,monospace;font-size:11px;line-height:1.4;
+       color:#ff0;min-height:32px;border-radius:3px;white-space:pre-wrap}
+</style>
+</head>
+<body>
+<h3>🐕📷 QR 位姿 → 机器狗 两段式自动导航 <span style="color:#888">(V2 策略)</span>
+   <a href="/qr_nav" style="font-size:11px">← V1 页面</a></h3>
+
+<!-- ============= ✨ ▶ 一键完成 (主入口, 单按钮跑完整 6 段) ============= -->
+<div class="panel" style="background:linear-gradient(90deg,#001a33,#003366);
+                          border:2px solid #4af;margin-bottom:8px;
+                          padding:8px;border-radius:4px">
+  <div class="row2" style="text-align:center">
+    <button class="btn-block" id="b_autofull"
+            style="background:#4af;color:#000;font-size:18px;font-weight:bold;
+                   padding:14px;letter-spacing:2px"
+            onclick="autoFullStart()">▶ 一键完成 (10~15 秒)</button>
+  </div>
+  <!-- ★ 手动分步: 主流程区醒目两列按钮, 不再折叠在 details 里 -->
+  <div class="row2" style="text-align:center;margin-top:8px">
+    <button class="btn-block" id="b_cap1"
+            style="width:48%;background:#0a0;color:#000;font-size:14px;font-weight:bold;
+                   padding:12px;display:inline-block"
+            onclick="call('/qr_nav2/capture1')">📸 ① 第一次捕获<br><span style="font-size:10px">(算 3D pose, 不动云台)</span></button>
+    <button class="btn-block" id="b_exec1"
+            style="width:48%;background:#08f;color:#fff;font-size:14px;font-weight:bold;
+                   padding:12px;display:inline-block;margin-left:4px"
+            onclick="call('/qr_nav2/exec_lateral')">↔️ ① 执行横移<br><span style="font-size:10px">(调狗, 不动云台)</span></button>
+  </div>
+  <!-- ★ 关键: 在 ① 捕获和 ① 横移之间加「开始运动」按钮
+       V2 默认用 stand_quiet 静默起立 (狗站着腿不动), 横移前需主动 start_motion + 切行走 gait
+       用户实测: 自动 start_motion 容易失败, 加这个按钮让用户明确控制 -->
+  <div class="row2" style="text-align:center;margin-top:6px">
+    <button class="btn-block" id="b_start_motion"
+            style="width:100%;background:#f80;color:#000;font-size:14px;font-weight:bold;
+                   padding:10px;display:inline-block"
+            onclick="dog('motion')">🏃 开始运动（页面1）<br><span style="font-size:10px">(原地踏步 + 切行走 gait, 让狗真能动起来)</span></button>
+  </div>
+  <div id="autofull_prog" style="margin-top:8px;display:none">
+    <div style="background:#000;border:1px solid #4af;height:22px;border-radius:3px;overflow:hidden">
+      <div id="autofull_bar" style="background:linear-gradient(90deg,#4af,#0f8);
+                                    height:100%;width:0%;transition:width .4s"></div>
+    </div>
+    <div id="autofull_msg" style="color:#4af;font-size:13px;margin-top:5px;
+                                  font-family:Consolas,monospace;font-weight:bold">就绪</div>
+  </div>
+  <div style="color:#8cf;font-size:11px;margin-top:6px;line-height:1.5">
+    ✨ 自动: 狗初始化 → ① 捕获 → ① 横移 → 狗就位(自动) → ② 捕获 → ② 云台+变倍<br>
+    ⚠ 任何阶段失败自动停止, 可手动点「↺ 重置」再重试, 或展开「📋 手动分步」单步调试
+  </div>
+</div>
+
+<!-- 步骤条: 6 段 (idle → done) -->
+<div class="stepbar" id="stepbar">
+  <div class="step" data-phase="idle">0 idle</div>
+  <div class="arrow">→</div>
+  <div class="step" data-phase="first_captured">① 捕获</div>
+  <div class="arrow">→</div>
+  <div class="step" data-phase="first_executed">① 执行横移</div>
+  <div class="arrow">→</div>
+  <div class="step" data-phase="dog_ready">狗就位</div>
+  <div class="arrow">→</div>
+  <div class="step" data-phase="second_captured">② 捕获</div>
+  <div class="arrow">→</div>
+  <div class="step" data-phase="done">② 执行云台+变倍</div>
+</div>
+
+<div class="row">
+  <div class="panel">
+    <div class="vid">
+      <img id="qr_img" src="/qr_nav/stream" alt="QR">
+      <div class="overlay" id="overlay">无 QR</div>
+    </div>
+    <div class="summary" id="live_summary">
+      <b>📊 实时位姿</b> <span id="ph_label" style="color:#0ff">— 阶段: idle —</span><br>
+      ↔ 横偏 <span id="live_lat">--</span> m &nbsp;
+      ⤵ 前距 <span id="live_fwd">--</span> m &nbsp;
+      🔍 占比 <span id="live_fill">--</span> &nbsp;
+      yaw <span id="live_yaw">--</span>°<br>
+      <span id="live_hint" style="color:#888">--</span>
+    </div>
+  </div>
+
+  <div class="panel" style="min-width:380px">
+    <details style="background:#3a2600;border:2px solid #f80;padding:8px;border-radius:4px">
+      <summary style="color:#f80;cursor:pointer;font-weight:bold;font-size:13px">
+        📋 手动分步 (备选 / 出错时单步调试) — 点展开
+      </summary>
+      <table style="width:100%;margin-top:6px;font-size:12px">
+        <tr><td style="color:#0f0">① 第一次捕获</td>
+            <td><button class="btn-block" id="b_cap1"
+                onclick="call('/qr_nav2/capture1')">📸① 第一次捕获 (算 3D, 不动云台)</button></td></tr>
+        <!-- ★ 关键: 在 ① 执行横移 前加「开始运动」按钮 (用户明确控制) -->
+        <tr><td style="color:#f80">🏃 开始运动</td>
+            <td><button class="btn-block" id="b_start_motion_manual" style="background:#f80;color:#000"
+                onclick="dog('motion')">🏃 开始运动（页面1）<br><span style="font-size:10px">(起立+手动+力控+开始运动+gait, 让狗真动起来)</span></button></td></tr>
+        <tr><td style="color:#0f0">① 执行横移</td>
+            <td><button class="btn-block" id="b_exec1" style="background:#08f"
+                onclick="call('/qr_nav2/exec_lateral')">↔️① 执行横移 (调狗, 第一次不动云台)</button></td></tr>
+        <tr><td style="color:#888">✓ 狗就位 (自动)</td>
+            <td><button class="btn-block" id="b_dogready" style="background:#0c0;color:#000"
+                onclick="call('/qr_nav2/dog_ready')">✓ 手动标狗就位 (一般无须点)</button></td></tr>
+        <tr><td style="color:#0f0">② 第二次捕获</td>
+            <td><button class="btn-block" id="b_cap2"
+                onclick="call('/qr_nav2/capture2')">📸② 第二次捕获 (底层算法同①)</button></td></tr>
+        <tr><td style="color:#0f0">② 执行云台+变倍</td>
+            <td><button class="btn-block" id="b_exec2" style="background:#f0f;color:#000"
+                onclick="call('/qr_nav2/exec_gimbal_zoom')">🔄② 执行云台+变倍 (转回图像中心 + 变倍)</button></td></tr>
+        <tr><td style="color:#f44">↺ 重置</td>
+            <td><button class="btn-block danger" id="b_reset"
+                onclick="call('/qr_nav2/reset')">↺ 重置 → 回到阶段 0</button></td></tr>
+      </table>
+    </details>
+
+    <div class="row2" style="margin-top:8px">
+      <button class="btn-block warn" id="b_init"
+              onclick="dog('stand_quiet')" style="width:48%;background:#0a6">🦿 静默起立</button>
+      <button class="btn-block danger" id="b_stop"
+              onclick="dog('stop')" style="width:48%;background:#a30">⏹ 复位 (停止+趴下)</button>
+    </div>
+    <div style="color:#888;font-size:10px;text-align:center;margin-top:2px">
+      <b>🦿 初始化</b> = 起立+手动+力控+开始运动 (原地踏步); <b>⏹ 复位</b> = 停止+趴下复位+断开。<br>
+      两个独立按钮, 文字和动作一一对应, 不会反。<br>
+      走的是和主页面同一个 <b>/dog/stand</b> · <b>/dog/stop</b> 链路, 不再经服务端自回调。
+    </div>
+    <div class="row2" style="font-size:11px;color:#aaa">
+      状态: <span id="init_state" style="color:#f80">未知</span> &nbsp;
+      <span id="step_stand">①</span>·
+      <span id="step_force">②</span>·
+      <span id="step_motion">③</span>
+    </div>
+
+    <div class="summary">
+      <b>📦 第一次捕获结果 (first_pose)</b><br>
+      <span id="cap1_summary" style="color:#888">未捕获</span>
+    </div>
+    <div class="summary">
+      <b>📦 第二次捕获结果 (second_pose)</b><br>
+      <span id="cap2_summary" style="color:#888">未捕获</span>
+    </div>
+    <div class="log" id="log">
+      <div>⏳ 等待操作…</div>
+    </div>
+    <div class="hint" id="hint">提示: ① 捕获 → ① 横移 → ✓ 狗就位 → ② 捕获 → ② 云台+变倍</div>
+  </div>
+
+  <div class="panel" style="min-width:300px">
+    <details>
+      <summary style="color:#0cf;cursor:pointer;font-weight:bold;padding:4px 0">
+        🤖 机器狗驱动 (14 个按钮) — 点展开高级控制
+      </summary>
+      <!-- ===== 🦿 机器狗驱动: 与参照主页面完全同款 ===== -->
+    <div class="row2">
+      <b style="color:#0cf">🦿 机器狗驱动 (与主页面同款)</b>
+    </div>
+    <!-- ① ② ③ 三步使能 (关键: 缺力控/开始运动腿不动) -->
+    <div class="row2">
+      <button class="btn-block" style="background:#0c0;color:#000"
+              onclick="dog('stand')">① 起立 (连接+力控+开始运动)</button>
+    </div>
+    <div class="row2">
+      <button style="background:#08f;width:48%" onclick="dog('force')">② 力控</button>
+      <button style="background:#08f;width:48%" onclick="dog('motion')">③ 开始运动</button>
+    </div>
+    <div style="color:#888;font-size:10px;text-align:center">
+      ⚠ 缺「力控」移动指令被丢, 缺「开始运动」狗腿不动
+    </div>
+    <!-- 步长调节 (与主页面同款: 0.2m / 15°, 上限 0.3m / 30°) -->
+    <div class="row2" style="text-align:center;margin-top:6px">
+      <button class="btn-dog" onclick="dogstep(-1)">− 步长</button>
+      <span id="dog_step" style="color:#0cf;font-size:13px;margin:0 8px">0.2m / 15°</span>
+      <button class="btn-dog" onclick="dogstep(1)">+ 步长</button>
+    </div>
+    <!-- 方向按钮: 带 ?v=<步长> (与主页面一致, 不带 v 后端会用默认步长) -->
+    <div class="grid" style="margin:auto;width:fit-content;grid-template-columns:repeat(3,72px)">
+      <div></div>
+      <button class="btn-dogm" onclick="dog('fwd')">⬆ 前进</button>
+      <div></div>
+      <button class="btn-dogm" onclick="dog('left')">⬅ 左移</button>
+      <button class="btn-dogm" style="background:#c33" onclick="dog('down')">⏹ 趴下</button>
+      <button class="btn-dogm" onclick="dog('right')">➡ 右移</button>
+      <div></div>
+      <button class="btn-dogm" onclick="dog('back')">⬇ 后退</button>
+      <div></div>
+    </div>
+    <div class="row2" style="margin-top:4px;text-align:center">
+      <button class="btn-dogm" style="width:48%" onclick="dog('tl')">↺ 左转</button>
+      <button class="btn-dogm" style="width:48%" onclick="dog('tr')">↻ 右转</button>
+    </div>
+    <div class="row2" style="margin-top:4px;text-align:center">
+      <button class="danger" style="width:48%" onclick="dog('damp')">💧 阻尼</button>
+      <button class="danger" style="width:48%" onclick="dog('stop')">✖ 停止并断开</button>
+    </div>
+    <div class="msg" id="dog_msg">机器狗未连接: 先「① 起立」→「② 力控」→「③ 开始运动」</div>
+    <div class="row2" style="margin-top:4px">
+      <button style="background:#444;font-size:10px;width:100%"
+              onclick="checkDogConn()">🔍 检查狗连接 (GET /dog_msg)</button>
+    </div>
+    </details>
+
+    <div class="row2" style="margin-top:8px">
+      <b style="color:#0cf">🔍 镜头 (变倍+对焦)</b>
+    </div>
+    <div class="row2">
+      <button style="background:#08f;width:30%" onclick="call('/qr_nav/zoom/out')">🔍-</button>
+      <button style="background:#08f;width:33%" onclick="call('/qr_nav/zoom/auto')">🎯自动</button>
+      <button style="background:#08f;width:30%" onclick="call('/qr_nav/zoom/in')">🔍+</button>
+    </div>
+    <div class="row2">
+      <button style="background:#08f;width:100%" onclick="call('/qr_nav/zoom/focus')">🔲 自动对焦</button>
+    </div>
+    <div class="row2" style="margin-top:8px">
+      <b style="color:#888;font-size:11px">🔧 中心换算</b>
+    </div>
+    <div class="row2" style="font-size:11px;color:#aaa">
+      横偏死区 <span id="lat_dead">5</span>mm / 中心死区
+      <span id="ctr_dead">4</span>px<br>
+      云台单次增量上限 = FOV/2
+    </div>
+    <div class="row2">
+      <button style="background:#444;font-size:10px;width:100%"
+              onclick="call('/qr_nav2/toggle_center_yaw')">↔ 翻 CENTER_YAW_SIGN</button>
+    </div>
+    <div class="row2">
+      <button style="background:#444;font-size:10px;width:100%"
+              onclick="call('/qr_nav2/toggle_center_pitch')">↕ 翻 CENTER_PITCH_SIGN</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============= 🤖 机器人运动 (V1 模式一键) ============= -->
+<!-- 把 V1 全部"机器人运动"按钮合并到这里, 一个页面搞定, 不必切回 /qr_nav -->
+<details style="margin-top:8px">
+  <summary style="background:#3a0010;border:2px solid #f44;padding:8px;cursor:pointer;
+                   color:#f44;font-weight:bold">
+    ⚙ 高级 / V1 模式 (5 个一键) — 点展开
+  </summary>
+  <div class="panel" style="background:#3a0010;border:2px solid #f44;margin-top:2px">
+  <b style="color:#f44">🤖 机器人运动 (一键, V1 模式)</b>
+  <span style="color:#888;font-size:11px;margin-left:6px">
+    ← V1 的「自动一步 / 仅横向对齐 / 一键执行 + 方向翻转」, V2 页面内可直接用
+  </span>
+  <table style="width:100%;margin-top:6px;font-size:12px">
+    <tr>
+      <td style="color:#0f0;width:130px">🎯 自动一步 (横移+变倍)</td>
+      <td>
+        <button class="btn-block" style="background:#0a0;color:#000"
+                onclick="call('/qr_nav2/auto')">🎯 自动一步 (按最近 pose 决策 + 串行执行)</button>
+      </td>
+      <td style="color:#888;font-size:10px">单步按钮, 不重新捕获</td>
+    </tr>
+    <tr>
+      <td style="color:#0f0">↔️ 仅横向对齐</td>
+      <td>
+        <button class="btn-block" style="background:#08f"
+                onclick="call('/qr_nav2/align')">↔️ 仅横向对齐 (只横移, 不变倍)</button>
+      </td>
+      <td style="color:#888;font-size:10px">横移后变倍由用户控</td>
+    </tr>
+    <tr>
+      <td style="color:#0f0">🚀 一键执行</td>
+      <td>
+        <button class="btn-block" id="b_execplan" style="background:#f0f;color:#000"
+                onclick="execPlanLoop()">🚀 一键执行 (循环 横移+变倍, 直至对齐)</button>
+      </td>
+      <td style="color:#888;font-size:10px">前端 JS 循环调, 50 步硬限</td>
+    </tr>
+    <tr>
+      <td style="color:#f80">↔ 翻转左右方向</td>
+      <td>
+        <button class="btn-block" style="background:#f80;color:#222"
+                onclick="call('/qr_nav2/lateral_sign')">↔ 翻转 LATERAL_SIGN (左右反了点这个)</button>
+      </td>
+      <td style="color:#888;font-size:10px">单独翻横移方向</td>
+    </tr>
+    <tr>
+      <td style="color:#f80">🔄 反转 yaw</td>
+      <td>
+        <button class="btn-block" style="background:#f80;color:#222"
+                onclick="call('/qr_nav2/yaw_sign')">🔄 反转 YAW_SIGN (云台左右反了用这个)</button>
+      </td>
+      <td style="color:#888;font-size:10px">会同时翻前后/左右, 慎用</td>
+    </tr>
+  </table>
+  <div style="color:#888;font-size:10px;margin-top:6px">
+    ⚠ 上述 5 个按钮在 V2 页面里直接生效 (使用最近一次捕获的 pose),
+      不走 V2 的 6 段式状态机. V2 的两段式流程 (① 捕获→横移 → ② 捕获→云台+变倍) 仍在顶部.
+  </div>
+  </div>
+</details>
+
+<script>
+// ══════════════════════════════════════════════════════════
+//  🦿 机器狗驱动 (与参照主页面 gimbal_pose_estimation_ascend.py 同款)
+//    关键: 必须带 ?v=<步长>; 单步模式每次只走固定一步
+// ══════════════════════════════════════════════════════════
+var DOG_LOCK_M = 0.3, DOG_LOCK_DEG = 30;
+var dogStepM = 0.2, dogStepDeg = 15;
+var dogBusy = false;
+var dogReadyCache = false;      // 由 /qr_nav/dog_ready 轮询刷新
+
+// ── 🦿 一键初始化 / 停止 切换 ──
+//    与参照主页面完全同路径: 浏览器直接打 /dog/stand 或 /dog/stop,
+//    不再经服务端 /qr_nav/init_all 自回调 (那条链路曾被代理/冷却卡死)
+//
+//    关键时序 (防止"刚点完初始化立刻点停止"卡死):
+//      • 后端 dog.init() 串行下发 心跳→起立→手动→力控→开始运动→gait ≈3.5s
+//      • 但 fetch 返回时间 ≈ 后端把指令塞进发送队列的时间, 远早于狗硬件完成
+//      • 旧逻辑 dogBusy 在 fetch 返回瞬间就释放 → 用户在过渡期点 stop,
+//        dog.close() 撞上未完成的 motion 指令 → 后端阻塞 / 狗卡顿
+//    新逻辑: 锁延长到"狗硬件稳定", 走 DOG_LOCK_INIT_MS / DOG_LOCK_STOP_MS
+//
+//    按钮拆成两个独立按钮 (#b_init 调 stand, #b_stop 调 stop),
+//    文字和动作一一对应, 杜绝"反了"歧义
+function syncInitBtn(){
+  // 仅更新指示灯 (🦿 静默起立 / ⏹ 复位 按钮文字固定, 不再切换)
+  // V2 的「静默起立」可重复点 (没副作用, idempotent), 永远高亮
+  // 「⏹ 复位」狗未就绪时灰显
+  const initBtn = document.getElementById('b_init');
+  const stopBtn = document.getElementById('b_stop');
+  if (initBtn) initBtn.style.opacity = '1.0';
+  if (stopBtn) {
+    if (dogReadyCache) stopBtn.style.opacity = '1.0';
+    else               stopBtn.style.opacity = '0.5';
+  }
+}
+
+// ★ 锁时长配置 —— 经验值, 与 robot_interface.Dog 实测对齐
+//   init (stand/force/motion): 后端 3.5s + 1s 硬件稳定 = 4.5s
+//   stop  (stop/down/damp)  : 后端 ~1s + 2.5s 完全停下 = 3.5s
+//   移动 (fwd/left/...)     : 0.6m/s × 0.2m ≈ 0.4s + 0.5s 余量 = 0.9s
+//   转向 (tl/tr)           : 慢一些, 1.2s
+var DOG_LOCK_INIT_MS  = 4500;
+var DOG_LOCK_STOP_MS  = 3500;
+var DOG_LOCK_MOVE_MS  = 900;
+var DOG_LOCK_TURN_MS  = 1200;
+function _lock_ms_for(a){
+  if (a=='stand'||a=='force'||a=='motion'||a=='start'||a=='stand_quiet') return DOG_LOCK_INIT_MS;
+  if (a=='stop' ||a=='down' ||a=='damp')               return DOG_LOCK_STOP_MS;
+  if (a=='tl'   ||a=='tr')                              return DOG_LOCK_TURN_MS;
+  return DOG_LOCK_MOVE_MS;
+}
+
+function dog(a){
+  if (dogBusy) return;                       // 上一步未完成, 忽略本次点击
+  // stand/force/motion/stop/down/damp/stand_quiet 不需要步长; tl/tr 用角度; 其余用平移步长
+  var v = (a=='tl' || a=='tr') ? dogStepDeg
+        : (a=='stand'||a=='force'||a=='motion'||a=='start'||a=='stop'||a=='down'||a=='damp'||a=='stand_quiet') ? 0
+        : dogStepM;
+  var lockMs    = _lock_ms_for(a);           // ★ 硬件完成才释放
+  var isInitAct = (a=='stand'||a=='force'||a=='motion'||a=='start'||a=='stand_quiet');
+  var isStopAct = (a=='stop' ||a=='down' ||a=='damp');
+  // ★ 关键: stand_quiet (V2 一键初始化) **不**追加 motion 链
+  //   静默起立后, 狗站着但腿不动, 适合拍 QR (无踏步抖动)
+  //   后续在 _move_lateral_steps 里会主动 start_motion + set_gait(行走)
+  //   旧 stand/init 路径 (V1 主页) 仍自动追加 motion 链, 不变
+  var needFollowupWalk = (a=='stand' || a=='init' || a=='connect');
+  dogBusy = true;
+  var ms = document.querySelectorAll('.btn-dogm');
+  ms.forEach(function(b){ b.disabled = true; });
+  var e = document.getElementById('dog_msg');
+  if (e) e.innerText = '⏳ 执行中: /dog/' + a + '?v=' + v + ' ...';
+  log('→ /dog/' + a + '?v=' + v + '  (锁 ' + (lockMs/1000).toFixed(1) + 's)' +
+      (needFollowupWalk ? '  → 后续将追加 motion?gait=0x21010301' : ''),
+      'info');
+  fetch('/dog/' + a + '?v=' + v)
+    .then(function(r){ return r.text(); })
+    .then(function(t){
+      log('← /dog/' + a + '  ' + t,
+          t.indexOf('✗')>=0 || t.indexOf('ERR')>=0 ? 'err' :
+          (t.indexOf('⚠')>=0 ? 'warn' : 'ok'));
+      // 失败: 不再追加 walk
+      if (t && (t.indexOf('✗') >= 0 || t.indexOf('ERR') >= 0)) {
+        if (e) e.innerText = t + '  (失败, 不再追加 walk)';
+        return { ok:false, t:t };
+      }
+      if (e) e.innerText = t + '  ⏳ 硬件稳定 ' + (lockMs/1000).toFixed(1) + 's';
+      if (!needFollowupWalk) {
+        pollDogState();
+        return { ok:true, t:t };
+      }
+      // ★ 自动追加 motion?gait=0x21010301 (切到行走 gait)
+      if (e) e.innerText += '\n  → 自动追加 motion?gait=0x21010301 (让狗切到行走 gait, 后续 move 才平移)';
+      log('→ /dog/motion?v=0&gait=0x21010301  (自动追加, 切行走 gait)', 'info');
+      return fetch('/dog/motion?v=0&gait=0x21010301')
+        .then(function(r2){ return r2.text(); })
+        .then(function(t2){
+          log('← /dog/motion?gait=0x21010301  ' + t2,
+              t2.indexOf('✗')>=0 || t2.indexOf('ERR')>=0 ? 'err' : 'ok');
+          if (t2 && (t2.indexOf('✗') >= 0 || t2.indexOf('ERR') >= 0)) {
+            if (e) e.innerText = '✗ 切行走 gait 失败: ' + t2;
+            return { ok:false, t:t, t2:t2 };
+          }
+          if (e) e.innerText = '✓ ' + t + ' + ✓ 切行走 gait → 准备就绪';
+          pollDogState();
+          return { ok:true, t:t, t2:t2 };
+        });
+    })
+    .catch(function(err){
+      if (e) e.innerText = '✗ 请求失败: ' + err + '  (立即释放锁)';
+      log('✗ /dog/' + a + '  ' + err, 'err');
+      // ★ 失败时立即释放, 不让用户干等
+      lockMs = 0;
+      return { ok:false, t:'请求失败' };
+    })
+    .then(function(res){
+      if (lockMs === 0) {
+        // 失败 / 普通移动: 立即释放
+        if (res && res.ok && isInitAct) { dogReadyCache = true;  syncInitBtn(); }
+        if (res && res.ok && isStopAct) { dogReadyCache = false; syncInitBtn(); }
+        if (!res || !res.ok)            { dogReadyCache = false; syncInitBtn(); }
+        dogBusy = false;
+        ms.forEach(function(b){ b.disabled = false; });
+        return;
+      }
+      // ★ 关键: 延后释放锁, 防止 stop 撞上未完成的 init
+      setTimeout(function(){
+        if (res && res.ok && isInitAct) { dogReadyCache = true;  syncInitBtn(); }
+        if (res && res.ok && isStopAct) { dogReadyCache = false; syncInitBtn(); }
+        if (!res || !res.ok)            { dogReadyCache = false; syncInitBtn(); }
+        pollDogState();
+        dogBusy = false;
+        ms.forEach(function(b){ b.disabled = false; });
+        if (e) e.innerText += '  ✓ 稳定, 可操作';
+        log('✓ /dog/' + a + ' 锁已释放, dogReady=' + dogReadyCache, 'ok');
+      }, lockMs);
+    });
+}
+function dogstep(d){
+  if (d > 0){
+    dogStepM   = Math.min(DOG_LOCK_M,   +(dogStepM + 0.1).toFixed(1));
+    dogStepDeg = Math.min(DOG_LOCK_DEG, dogStepDeg + 5);
+  } else {
+    dogStepM   = Math.max(0.1, +(dogStepM - 0.1).toFixed(1));
+    dogStepDeg = Math.max(5,   dogStepDeg - 5);
+  }
+  var el = document.getElementById('dog_step');
+  if (el) el.innerText = dogStepM + 'm / ' + dogStepDeg + '°';
+}
+function checkDogConn(){
+  var e = document.getElementById('dog_msg');
+  fetch('/dog_msg').then(function(r){ return r.text(); }).then(function(t){
+    if (e) e.innerText = t || '(空)';
+    log('← /dog_msg  ' + t, 'ok');
+  }).catch(function(err){
+    if (e) e.innerText = '✗ /dog_msg 请求失败: ' + err;
+  });
+}
+
+var callBusy = false;
+async function call(path){
+  if (callBusy) return;
+  callBusy = true;
+  var e = document.getElementById('hint');
+  e.textContent = '⏳ ' + path + ' ...';
+  log('→ ' + path, 'info');
+  try {
+    const r = await fetch(path);
+    const t = await r.text();
+    e.textContent = path + ' → ' + t;
+    log('← ' + path + '  ' + t, t.indexOf('✗')>=0 || t.indexOf('ERR')>=0 ? 'err' :
+                         (t.indexOf('⚠')>=0 || t.indexOf('⏳')>=0 ? 'warn' : 'ok'));
+  } catch(err) {
+    e.textContent = '✗ ' + path + ' 请求失败: ' + err;
+    log('✗ ' + path + '  ' + err, 'err');
+  } finally {
+    callBusy = false;
+    pollPhase();
+  }
+}
+function log(msg, level){
+  var div = document.getElementById('log');
+  var c = level==='err' ? 'err' : (level==='warn' ? 'warn' : 'ok');
+  div.innerHTML = '<div class="' + c + '">[' + new Date().toLocaleTimeString() + '] ' + msg + '</div>' + div.innerHTML;
+  // 限长
+  while (div.children.length > 30) div.removeChild(div.lastChild);
+}
+
+async function pollPhase(){
+  try {
+    const r = await fetch('/qr_nav2/phase');
+    const s = await r.json();
+    // 1) 步骤条
+    const order = ['idle','first_captured','first_executed','dog_ready','second_captured','done'];
+    const steps = document.querySelectorAll('.stepbar .step');
+    let curIdx = order.indexOf(s.phase);
+    if (curIdx < 0) curIdx = 0;
+    steps.forEach((el, i) => {
+      el.classList.remove('active', 'done', 'cur');
+      if (i < curIdx) el.classList.add('done');
+      else if (i === curIdx) el.classList.add('cur');
+    });
+    document.getElementById('ph_label').textContent = '— 阶段: ' + s.phase + ' —';
+    // 2) 按钮启用 / 禁用 (按阶段)
+    //    ★ b_exec1 永远可点 (任何 phase 包括 idle), exec_phase1_lateral 内部会
+    //      自动先跑 first_capture_once 兜底, 解决「QR 偶尔检测不到,
+    //      phase 卡在 idle, b_exec1 永远 disabled」的问题
+    const allow = {
+      'b_cap1':     ['idle','first_captured'],
+      'b_exec1':    ['idle','first_captured','first_executed','dog_ready','second_captured','done'],
+      'b_dogready': ['first_executed','dog_ready','second_captured','done'],
+      'b_cap2':     ['dog_ready','first_executed','second_captured','done'],
+      'b_exec2':    ['second_captured','done'],
+      'b_reset':    ['first_captured','first_executed','dog_ready','second_captured','done'],
+    };
+    for (const id in allow){
+      const el = document.getElementById(id);
+      if (el) el.disabled = !allow[id].includes(s.phase);
+    }
+    // 3) 摘要
+    const fmt = (sm) => {
+      if (!sm) return '—';
+      return (sm.lateral_world!==null ? ('横偏 ' + (sm.lateral_world>=0?'+':'') + sm.lateral_world.toFixed(3) + 'm') : '横偏 --')
+           + '  前距 ' + (sm.forward_world!==null?sm.forward_world.toFixed(2):'--') + 'm'
+           + '  占比 ' + (sm.fill_ratio!==null?(sm.fill_ratio*100).toFixed(1):'--') + '%'
+           + '  yaw ' + (sm.gimbal_yaw_deg!==null?sm.gimbal_yaw_deg.toFixed(1):'--') + '°';
+    };
+    const c1 = document.getElementById('cap1_summary');
+    const c2 = document.getElementById('cap2_summary');
+    if (c1) c1.innerHTML = s.first_capture_msg ? (s.first_capture_msg + '<br>' + fmt(s.first_pose_summary)) : '— 未捕获 —';
+    if (c2) c2.innerHTML = s.second_capture_msg ? (s.second_capture_msg + '<br>' + fmt(s.second_pose_summary)) : '— 未捕获 —';
+    // 4) cfg 提示
+    if (s.cfg) {
+      const ld = document.getElementById('lat_dead');
+      const cd = document.getElementById('ctr_dead');
+      if (ld) ld.textContent = (s.cfg.exec_min_lat*1000).toFixed(0);
+      if (cd) cd.textContent = s.cfg.center_dead_px.toFixed(0);
+    }
+  } catch(e) {}
+}
+
+async function poll(){
+  const S = (id, fn) => { try { const el=document.getElementById(id); if(el) el.textContent=fn(); } catch(e){} };
+  try {
+    const r = await fetch('/qr_nav/pose');
+    const j = await r.json();
+    if (!j.ready){
+      ['live_lat','live_fwd','live_fill','live_yaw'].forEach(id=>S(id,()=>'--'));
+      S('live_hint', ()=>j.hint||'等待 QR…');
+      S('overlay', ()=>'无 QR');
+    } else {
+      S('live_lat',  ()=> (j.lateral_world>=0?'+':'') + j.lateral_world.toFixed(3));
+      S('live_fwd',  ()=> j.forward_world.toFixed(2));
+      S('live_fill', ()=> (j.fill_ratio*100).toFixed(1) + '%');
+      S('live_yaw',  ()=> j.gimbal_yaw_deg.toFixed(1));
+      S('live_hint', ()=> j.hint);
+      S('overlay', ()=>'前 '+j.forward_world.toFixed(2)+'m  横 '+(j.lateral_world>=0?'+':'')+j.lateral_world.toFixed(2)+'m');
+    }
+  } catch(e) {}
+  setTimeout(poll, 400);
+}
+poll();
+
+async function pollDogState(){
+  try {
+    const r = await fetch('/qr_nav/dog_ready');
+    const j = await r.json();
+    // 同步「一键初始化 / 停止」切换状态
+    dogReadyCache = !!(j.motion || j.ready);
+    syncInitBtn();
+    const setLight = (id, ok) => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = ok ? '🟢' : '⚪';
+    };
+    setLight('step_stand',  j.stand);
+    setLight('step_force',  j.force);
+    setLight('step_motion', j.motion);
+    const s = document.getElementById('init_state');
+    if (s) {
+      if (j.motion)      { s.textContent='✅ 已就绪, 可运动'; s.style.color='#0f0'; }
+      else if (j.force)  { s.textContent='⚠ 已力控, 还差开始运动'; s.style.color='#f80'; }
+      else if (j.stand)  { s.textContent='⚠ 已起立, 还差力控'; s.style.color='#f80'; }
+      else               { s.textContent='❌ 未初始化'; s.style.color='#f44'; }
+    }
+  } catch(e) {}
+}
+pollDogState();
+setInterval(pollDogState, 3000);
+pollPhase();
+setInterval(pollPhase, 800);
+
+// ── 🚀 一键执行: 循环调 /qr_nav2/exec_plan 直到对齐 ──
+var execBusy = false;
+async function execPlanLoop(){
+  if (execBusy) return;
+  execBusy = true;
+  const btn = document.getElementById('b_execplan');
+  const hint = document.getElementById('hint');
+  const oldTxt = btn ? btn.innerText : '';
+  if (btn) btn.disabled = true;
+  let i = 0;
+  try {
+    while (i < 50) {
+      i++;
+      if (btn) btn.innerText = `🚀 第 ${i} 步...`;
+      const r = await fetch('/qr_nav2/exec_plan');
+      const t = await r.text();
+      log('[' + i + '] /qr_nav2/exec_plan → ' + t, t.indexOf('✗')>=0?'err':'ok');
+      if (t.indexOf('已对齐')>=0 && t.indexOf('变倍 OK')>=0) {
+        if (hint) hint.textContent = '✓ 一键执行完成 (横偏对齐 + 变倍 OK)';
+        break;
+      }
+      if (t.indexOf('无 QR')>=0) {
+        if (hint) hint.textContent = '✗ 无 QR, 中断';
+        break;
+      }
+      await new Promise(r => setTimeout(r, 600));
+    }
+    if (i >= 50 && hint) hint.textContent = '⏹ 超过 50 步, 自动停止';
+  } catch(e) {
+    log('一键执行异常: ' + e, 'err');
+  } finally {
+    if (btn) { btn.innerText = oldTxt || '🚀 一键执行 (循环 横移+变倍, 直至对齐)'; btn.disabled = false; }
+    execBusy = false;
+  }
+}
+
+// ══════════════════════════════════════════════════════════
+//  ✨ ▶ 一键完成 (后台线程跑 6 段, 500ms 轮询状态)
+//    - 点一次按钮 → 自动: 狗初始化 → ① 捕获 → ① 横移 →
+//      狗就位(自动) → ② 捕获 → ② 云台+变倍
+//    - 实时进度条 + 步骤文字
+//    - 失败自动停止, 保留手动分步兜底
+// ══════════════════════════════════════════════════════════
+var autoFullBusy = false;
+var autoFullTimer = null;
+async function autoFullStart(){
+  if (autoFullBusy) return;
+  autoFullBusy = true;
+  const btn  = document.getElementById('b_autofull');
+  const prog = document.getElementById('autofull_prog');
+  const bar  = document.getElementById('autofull_bar');
+  const msg  = document.getElementById('autofull_msg');
+  if (btn)  btn.disabled = true;
+  if (prog) prog.style.display = 'block';
+  if (bar)  bar.style.width = '0%';
+  if (msg) { msg.style.color = '#4af'; msg.textContent = '⏳ 启动后台线程 ...'; }
+  try {
+    const r = await fetch('/qr_nav2/auto_full');
+    const t = await r.text();
+    log('▶ 一键: ' + t, 'info');
+    if (t.indexOf('已在进行中') >= 0) {
+      if (msg) msg.textContent = '⏳ ' + t;
+    } else {
+      autoFullTimer = setInterval(pollAutoFull, 500);
+    }
+  } catch(e) {
+    if (msg) { msg.style.color = '#f44'; msg.textContent = '✗ 启动失败: ' + e; }
+    autoFullBusy = false;
+    if (btn)  btn.disabled = false;
+  }
+}
+async function pollAutoFull(){
+  try {
+    const r = await fetch('/qr_nav2/auto_full_status');
+    const s = await r.json();
+    const bar = document.getElementById('autofull_bar');
+    const msg = document.getElementById('autofull_msg');
+    const btn = document.getElementById('b_autofull');
+    if (bar) bar.style.width = Math.max(0, s.pct) + '%';
+    if (msg) msg.textContent = s.msg;
+    if (!s.running) {
+      clearInterval(autoFullTimer);
+      autoFullTimer = null;
+      autoFullBusy = false;
+      if (btn) btn.disabled = false;
+      if (msg) msg.style.color = (s.stage === 'error' || s.pct < 0) ? '#f44' : '#0f0';
+      // 阶段条和狗状态都刷一次
+      pollPhase();
+      pollDogState();
+      // 3 秒后清空错误色, 方便下次启动
+      setTimeout(function(){
+        if (msg) msg.style.color = '#4af';
+      }, 3000);
+    }
+  } catch(e) {}
+}
+</script>
+</body>
+</html>"""
+
+
+# ============================================================
+#  注册 V1 + V2 路由
+# ============================================================
+def _register_qr_nav_routes(app):
+    """同时挂 V1 (/qr_nav/*) 和 V2 (/qr_nav2/*)"""
+    from flask import Response
+
+    # ── V1 路由 (与 gimbal_qr_dog_auto_drive.py 同款) ──
+    @app.route("/qr_nav/stream")
+    def _qrnav_stream():
+        def gen():
+            while True:
+                jpg = _qrnav_jpg_buf.wait(0.5)
+                if jpg:
+                    yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                           + jpg + b"\r\n")
+        return Response(gen(),
+                        mimetype="multipart/x-mixed-replace; boundary=frame")
+
+    @app.route("/qr_nav/pose")
+    def _qrnav_pose():
+        with _qrnav_pose_lock:
+            pose = _qrnav_pose_box[0]
+        data = pose_to_command(pose)
+        try:
+            data["lat_max_step"] = float(
+                _QR_NAV_CFG.get("DOG_MAX_STEP_M", 0.30))
+        except Exception:
+            pass
+        return Response(json.dumps(data, ensure_ascii=False),
+                        mimetype="application/json; charset=utf-8")
+
+    @app.route("/qr_nav/capture")
+    def _qrnav_capture():
+        est = _qrnav_estimator_holder[0]
+        if est is None:
+            return Response("✗ estimator 未就绪", mimetype="text/plain; charset=utf-8")
+        frame = getattr(est, "current_frame", None)
+        if frame is None:
+            return Response("✗ 无视频帧", mimetype="text/plain; charset=utf-8")
+        if getattr(est, "_est_busy", False):
+            return Response("⏳ 上一步还没跑完", mimetype="text/plain; charset=utf-8")
+        try:
+            est._start_estimate_async(frame)
+        except Exception as e:
+            return Response(f"✗ 触发失败: {e}", mimetype="text/plain; charset=utf-8")
+        time.sleep(0.3)
+        t0 = time.time()
+        while time.time() - t0 < 15.0:
+            if not getattr(est, "_est_busy", False):
+                break
+            time.sleep(0.1)
+        pd = getattr(est, "latest_pose_data", None)
+        if pd is None:
+            return Response("✗ 估计失败", mimetype="text/plain; charset=utf-8")
+        with _qrnav_pose_lock:
+            _qrnav_pose_box[0] = pd
+            _qrnav_pose_ver[0] += 1
+        return Response("✓ V1 捕获完成", mimetype="text/plain; charset=utf-8")
+
+    @app.route("/qr_nav/do_lateral")
+    def _qrnav_do_lateral():
+        if not _qrnav_poll_busy.acquire(blocking=False):
+            return "⏳ 上一步还没跑完"
+        try:
+            ok, imsg = _ensure_dog_ready()
+            if not ok:
+                return Response(imsg, mimetype="text/plain; charset=utf-8")
+            msg = lateral_step_only()
+        except Exception as e:
+            msg = f"ERR {e}"
+        finally:
+            _qrnav_poll_busy.release()
+        return Response(msg, mimetype="text/plain; charset=utf-8")
+
+    @app.route("/qr_nav/do_zoom")
+    def _qrnav_do_zoom():
+        if not _qrnav_poll_busy.acquire(blocking=False):
+            return "⏳ 上一步还没跑完"
+        try:
+            msg = zoom_step_only()
+        except Exception as e:
+            msg = f"ERR {e}"
+        finally:
+            _qrnav_poll_busy.release()
+        return Response(msg, mimetype="text/plain; charset=utf-8")
+
+    @app.route("/qr_nav/init_all")
+    def _qrnav_init_all():
+        if not _qrnav_poll_busy.acquire(blocking=False):
+            return "⏳ 上一步还没跑完"
+        try:
+            ok, msg = _ensure_dog_ready(force_init=True)
+            if not ok and "冷却" not in msg:
+                msg = f"初始化失败: {msg}"
+        except Exception as e:
+            msg = f"ERR {e}"
+        finally:
+            _qrnav_poll_busy.release()
+        return Response(msg, mimetype="text/plain; charset=utf-8")
+
+    @app.route("/qr_nav/dog_ready")
+    def _qrnav_dog_ready():
+        try:
+            state = _get_dog_step_state()
+        except Exception as e:
+            return Response(json.dumps({"stand": False, "force": False,
+                                        "motion": False, "err": str(e)}),
+                            mimetype="application/json; charset=utf-8")
+        return Response(json.dumps(state, ensure_ascii=False),
+                        mimetype="application/json; charset=utf-8")
+
+    @app.route("/qr_nav/zoom/<action>")
+    def _qrnav_zoom(action):
+        est = _qrnav_estimator_holder[0]
+        gimbal = getattr(est, "gimbal", None)
+        if est is None or gimbal is None:
+            return Response("✗ 云台未就绪", mimetype="text/plain; charset=utf-8")
+        try:
+            act = str(action).lower().strip()
+            zmin = getattr(est, "_zoom_min", 1.0)
+            zmax = getattr(est, "_zoom_max", 30.0)
+            zstep = getattr(est, "zoom_step_val", 1.0)
+            cur = getattr(est, "current_zoom_mag", 1.0)
+            if act in ("in", "+"):
+                target = min(zmax, cur + zstep)
+                gimbal.zoom_to_magnification(target)
+                est.current_zoom_mag = target
+                msg = f"✓ 变倍+ → {target:.1f}x"
+            elif act in ("out", "-"):
+                target = max(zmin, cur - zstep)
+                gimbal.zoom_to_magnification(target)
+                est.current_zoom_mag = target
+                msg = f"✓ 变倍- → {target:.1f}x"
+            elif act == "auto":
+                with _qrnav_pose_lock:
+                    pose = _qrnav_pose_box[0]
+                if pose is None:
+                    return Response("✗ 无 QR 数据", mimetype="text/plain; charset=utf-8")
+                cmd = pose_to_command(pose)
+                fill = cmd.get("fill_ratio") or 0.0
+                if fill <= 1e-4:
+                    return Response("✗ QR 占比无效", mimetype="text/plain; charset=utf-8")
+                k = (_QR_NAV_CFG["ZOOM_TARGET"] / fill) ** 0.5
+                target = max(zmin, min(zmax, cur * k))
+                gimbal.zoom_to_magnification(target)
+                est.current_zoom_mag = target
+                msg = f"✓ 自动变倍 → {target:.1f}x"
+            elif act == "focus":
+                gimbal.auto_focus()
+                msg = "✓ 自动对焦已触发"
+            else:
+                msg = f"未知动作: {act}"
+            return Response(msg, mimetype="text/plain; charset=utf-8")
+        except Exception as e:
+            return Response(f"✗ 变倍失败: {e}",
+                            mimetype="text/plain; charset=utf-8")
+
+    @app.route("/qr_nav")
+    def _qrnav_page():
+        # V2 文件不提供 V1 HTML (避免文件过大), 让用户跳回 V1 页面
+        return Response(
+            """<!DOCTYPE html><html><head><meta charset="utf-8">
+            <title>V1 已迁移</title></head><body style="background:#1a1a1f;color:#eee;
+            font-family:Microsoft YaHei;padding:30px">
+            <h2>V1 页面请运行 <code>gimbal_qr_dog_auto_drive.py</code> 访问</h2>
+            <p>当前 V2 文件仅提供 <a style="color:#0cf" href="/qr_nav2">两段式 V2 页面</a></p>
+            </body></html>""",
+            mimetype="text/html; charset=utf-8")
+
+    # ── V2 路由 (核心) ──
+
+    @app.route("/qr_nav2")
+    def _qrnav2_page():
+        resp = Response(HTML_QR_NAV2_PAGE,
+                        mimetype="text/html; charset=utf-8")
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+        return resp
+
+    @app.route("/qr_nav2/phase")
+    def _qrnav2_phase():
+        s = _phase_get()
+        # 附带 cfg 给前端显示
+        s["cfg"] = {
+            "exec_min_lat":    float(_QR_NAV_CFG.get("EXEC_MIN_LAT", 0.005)),
+            "center_dead_px":  float(_QR_NAV_CFG.get("CENTER_DEAD_PX", 4.0)),
+            "dog_max_step_m":  float(_QR_NAV_CFG.get("DOG_MAX_STEP_M", 0.30)),
+        }
+        return Response(json.dumps(s, ensure_ascii=False),
+                        mimetype="application/json; charset=utf-8")
+
+    @app.route("/qr_nav2/capture1")
+    def _qrnav2_capture1():
+        if not _qrnav_poll_busy.acquire(blocking=False):
+            return Response("⏳ 上一步还没跑完",
+                            mimetype="text/plain; charset=utf-8")
+        try:
+            # 捕获本身不依赖狗, 直接拍就行
+            # (狗就绪检查放到 exec_lateral 里, 那里 _move_lateral_steps 会自动兜底)
+            msg = first_capture_once()
+        except Exception as e:
+            msg = f"ERR {e}"
+        finally:
+            _qrnav_poll_busy.release()
+        return Response(msg, mimetype="text/plain; charset=utf-8")
+
+    @app.route("/qr_nav2/capture2")
+    def _qrnav2_capture2():
+        if not _qrnav_poll_busy.acquire(blocking=False):
+            return Response("⏳ 上一步还没跑完",
+                            mimetype="text/plain; charset=utf-8")
+        try:
+            msg = second_capture_once()
+        except Exception as e:
+            msg = f"ERR {e}"
+        finally:
+            _qrnav_poll_busy.release()
+        return Response(msg, mimetype="text/plain; charset=utf-8")
+
+    @app.route("/qr_nav2/exec_lateral")
+    def _qrnav2_exec_lateral():
+        if not _qrnav_poll_busy.acquire(blocking=False):
+            return Response("⏳ 上一步还没跑完",
+                            mimetype="text/plain; charset=utf-8")
+        try:
+            # ★ 关键修复: 不再前置调 _ensure_dog_ready()
+            #   - V2 用 stand_quiet (motion 永远 False), _ensure_dog_ready 会误判
+            #   - _init_dog_3steps 走 HTTP 链路, 受 _http_dog_busy 锁影响
+            #   - 改让 exec_phase1_lateral → _move_lateral_steps 内部兜底
+            #     (主动创建 dog 实例, 未就绪时调 init, gait=None 时调 start_motion+set_gait)
+            msg = exec_phase1_lateral()
+        except Exception as e:
+            import traceback
+            msg = f"ERR {e}\n{traceback.format_exc()}"
+        finally:
+            _qrnav_poll_busy.release()
+        return Response(msg, mimetype="text/plain; charset=utf-8")
+
+    @app.route("/qr_nav2/exec_gimbal_zoom")
+    def _qrnav2_exec_gimbal_zoom():
+        if not _qrnav_poll_busy.acquire(blocking=False):
+            return Response("⏳ 上一步还没跑完",
+                            mimetype="text/plain; charset=utf-8")
+        try:
+            msg = exec_phase2_gimbal_zoom()
+        except Exception as e:
+            msg = f"ERR {e}"
+        finally:
+            _qrnav_poll_busy.release()
+        return Response(msg, mimetype="text/plain; charset=utf-8")
+
+    @app.route("/qr_nav2/dog_ready")
+    def _qrnav2_dog_ready():
+        if not _qrnav_poll_busy.acquire(blocking=False):
+            return Response("⏳ 上一步还没跑完",
+                            mimetype="text/plain; charset=utf-8")
+        try:
+            msg = mark_dog_ready()
+        except Exception as e:
+            msg = f"ERR {e}"
+        finally:
+            _qrnav_poll_busy.release()
+        return Response(msg, mimetype="text/plain; charset=utf-8")
+
+    @app.route("/qr_nav2/reset")
+    def _qrnav2_reset():
+        if not _qrnav_poll_busy.acquire(blocking=False):
+            return Response("⏳ 上一步还没跑完",
+                            mimetype="text/plain; charset=utf-8")
+        try:
+            msg = reset_phase()
+        except Exception as e:
+            msg = f"ERR {e}"
+        finally:
+            _qrnav_poll_busy.release()
+        return Response(msg, mimetype="text/plain; charset=utf-8")
+
+    @app.route("/qr_nav2/toggle_center_yaw")
+    def _qrnav2_toggle_yaw():
+        cur = _QR_NAV_CFG.get("CENTER_YAW_SIGN", +1)
+        new = -cur
+        _QR_NAV_CFG["CENTER_YAW_SIGN"] = new
+        return Response(f"✓ CENTER_YAW_SIGN: {cur:+d} → {new:+d}",
+                        mimetype="text/plain; charset=utf-8")
+
+    @app.route("/qr_nav2/toggle_center_pitch")
+    def _qrnav2_toggle_pitch():
+        cur = _QR_NAV_CFG.get("CENTER_PITCH_SIGN", +1)
+        new = -cur
+        _QR_NAV_CFG["CENTER_PITCH_SIGN"] = new
+        return Response(f"✓ CENTER_PITCH_SIGN: {cur:+d} → {new:+d}",
+                        mimetype="text/plain; charset=utf-8")
+
+    # ── V2 路由: 把 V1 全部"机器人运动"按钮并进来, 不必切回 V1 页面 ──
+
+    @app.route("/qr_nav2/auto")
+    def _qrnav2_auto():
+        """V1 兼容: 自动一步 (横移+变倍, 用最近一次 pose, 不重新捕获)"""
+        if not _qrnav_poll_busy.acquire(blocking=False):
+            return Response("⏳ 上一步还没跑完",
+                            mimetype="text/plain; charset=utf-8")
+        try:
+            ok, imsg = _ensure_dog_ready()
+            if not ok:
+                return Response(imsg, mimetype="text/plain; charset=utf-8")
+            msg = auto_step_nav()
+        except Exception as e:
+            msg = f"ERR {e}"
+        finally:
+            _qrnav_poll_busy.release()
+        return Response(msg, mimetype="text/plain; charset=utf-8")
+
+    @app.route("/qr_nav2/align")
+    def _qrnav2_align():
+        """V1 兼容: 仅横向对齐 (横移, 不动变倍)"""
+        if not _qrnav_poll_busy.acquire(blocking=False):
+            return Response("⏳ 上一步还没跑完",
+                            mimetype="text/plain; charset=utf-8")
+        try:
+            ok, imsg = _ensure_dog_ready()
+            if not ok:
+                return Response(imsg, mimetype="text/plain; charset=utf-8")
+            msg = align_step_nav()
+        except Exception as e:
+            msg = f"ERR {e}"
+        finally:
+            _qrnav_poll_busy.release()
+        return Response(msg, mimetype="text/plain; charset=utf-8")
+
+    @app.route("/qr_nav2/exec_plan")
+    def _qrnav2_exec_plan():
+        """V1 兼容: 一键执行 (横移+变倍 串行一次) — V2 单步等效"""
+        if not _qrnav_poll_busy.acquire(blocking=False):
+            return Response("⏳ 上一步还没跑完",
+                            mimetype="text/plain; charset=utf-8")
+        try:
+            ok, imsg = _ensure_dog_ready()
+            if not ok:
+                return Response(imsg, mimetype="text/plain; charset=utf-8")
+            msg = exec_plan_step()
+        except Exception as e:
+            msg = f"ERR {e}"
+        finally:
+            _qrnav_poll_busy.release()
+        return Response(msg, mimetype="text/plain; charset=utf-8")
+
+    @app.route("/qr_nav2/lateral_sign")
+    def _qrnav2_lateral_sign():
+        """V1 兼容: 切换 LATERAL_SIGN (横移方向翻转)"""
+        cur = _QR_NAV_CFG.get("LATERAL_SIGN", -1)
+        new = -cur
+        _QR_NAV_CFG["LATERAL_SIGN"] = new
+        return Response(
+            f"✓ LATERAL_SIGN: {cur:+d} → {new:+d} "
+            f"(横移方向{'正常' if new>0 else '已翻转'})",
+            mimetype="text/plain; charset=utf-8")
+
+    @app.route("/qr_nav2/yaw_sign")
+    def _qrnav2_yaw_sign():
+        """V1 兼容: 切换 YAW_SIGN (云台 yaw 方向翻转)"""
+        cur = _QR_NAV_CFG.get("YAW_SIGN", +1)
+        new = -cur
+        _QR_NAV_CFG["YAW_SIGN"] = new
+        return Response(
+            f"✓ YAW_SIGN: {cur:+d} → {new:+d} "
+            f"({'右转正' if new>0 else '左转正'})",
+            mimetype="text/plain; charset=utf-8")
+
+    # ── 一键全流程: 前端轮询 /qr_nav2/auto_full_status 看进度 ──
+
+    @app.route("/qr_nav2/auto_full")
+    def _qrnav2_auto_full():
+        """启动后台线程跑完整 6 段 (init → ① → 横移 → 狗就位 → ② → 云台+变倍)"""
+        if _is_af_running():
+            return Response("⏳ 一键流程已在进行中", mimetype="text/plain; charset=utf-8")
+        _set_af_status(True, "starting", "🚀 启动中 ...", 1)
+        threading.Thread(target=_auto_full_worker, daemon=True).start()
+        return Response("🚀 一键全流程已启动", mimetype="text/plain; charset=utf-8")
+
+    @app.route("/qr_nav2/auto_full_status")
+    def _qrnav2_auto_full_status():
+        """前端每 500ms 轮询, 取当前步骤 / 进度 / 状态文本"""
+        s = _qrnav_auto_full_status[0]
+        if s is None:
+            s = {"running": False, "stage": "idle", "msg": "(未启动, 点 ▶ 一键完成)", "pct": 0}
+        return Response(json.dumps(s, ensure_ascii=False),
+                        mimetype="application/json; charset=utf-8")
+
+    @app.route("/qr_nav2_index")
+    def _qrnav2_index():
+        return Response(
+            """<!DOCTYPE html><html><head><meta charset="utf-8">
+            <title>QR→狗 V2 + V1 合并</title>
+            <style>body{margin:0;background:#111}iframe{border:0;display:block}
+            #cloud{width:100%;height:620px;border-bottom:1px solid #333}
+            #qnav{width:100%;height:580px}</style></head>
+            <body>
+              <iframe id="cloud" src="/"></iframe>
+              <iframe id="qnav" src="/qr_nav2"></iframe>
+            </body></html>""",
+            mimetype="text/html; charset=utf-8")
+
+    return app
+
+
+# ============================================================
+#  启动合并 HTTP
+# ============================================================
+def start_combined_http_stream(port, owner=None):
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
+    app = _gpea._make_flask_app(owner=owner)
+    _register_qr_nav_routes(app)
+    t = threading.Thread(
+        target=lambda: app.run(host="0.0.0.0", port=port,
+                               debug=False, use_reloader=False),
+        daemon=True)
+    t.start()
+    return t
+
+
+# ============================================================
+#  main()
+# ============================================================
+def main():
+    parser = argparse.ArgumentParser(
+        description='两段式 QR 位姿 → 机器狗 自动导航 (V2 策略)')
+
+    # 与参照/V1 一致的 14 个参数
+    parser.add_argument('--gimbal_ip', type=str, default='192.168.1.99')
+    parser.add_argument('--gimbal_port', type=int, default=6001)
+    parser.add_argument('--qr_size', type=float, default=0.10)
+    parser.add_argument('--fov_x', type=float, default=60.0)
+    parser.add_argument('--model', type=str, default='./qr_yolov8.om')
+    parser.add_argument('--device-id', type=int, default=0)
+    parser.add_argument('--detector', type=str, default='opencv',
+                        choices=['opencv', 'pyzbar'])
+    parser.add_argument('--square_size', type=int, default=800)
+    parser.add_argument('--conf_threshold', type=float, default=0.2)
+    parser.add_argument('--nms_threshold', type=float, default=0.5)
+    parser.add_argument('--mode', type=str, default='video',
+                        choices=['single', 'interactive', 'video'])
+    parser.add_argument('--image', type=str, default=None)
+    parser.add_argument('--video', action='store_true')
+    parser.add_argument('--display_pose', action='store_true')
+
+    # 本文件独有
+    parser.add_argument('--cam', type=int, default=0)
+    parser.add_argument('--cam-w', type=int, default=1280)
+    parser.add_argument('--cam-h', type=int, default=720)
+    parser.add_argument('--port', type=int, default=5003)
+    parser.add_argument('--dog-ip', type=str, default='192.168.1.103')
+    parser.add_argument('--dog-port', type=int, default=43893)
+    parser.add_argument('--source', type=str, default='gimbal',
+                        choices=['gimbal', 'cam'])
+
+    args = parser.parse_args()
+
+    _QR_NAV_CFG["FOV_X"] = args.fov_x
+    _qrnav_dog_port_holder[0] = args.port
+
+    print("=" * 60)
+    print("QR 位姿 → 机器狗 两段式自动导航 (V2)")
+    print("=" * 60)
+    print(f"  参照参数: mode={args.mode}  model={args.model}")
+    print(f"    gimbal={args.gimbal_ip}:{args.gimbal_port}  fov_x={args.fov_x}°")
+    print(f"  V2 独有: port={args.port}  dog={args.dog_ip}:{args.dog_port}")
+    print("=" * 60)
+
+    try:
+        estimator = _gpea.GimbalPoseEstimator(
+            gimbal_ip=args.gimbal_ip,
+            gimbal_port=args.gimbal_port,
+            qr_size=args.qr_size,
+            fov_x=args.fov_x,
+            model_path=args.model,
+            device_id=args.device_id,
+            detector_type=args.detector,
+            square_size=args.square_size,
+            conf_threshold=args.conf_threshold,
+            nms_threshold=args.nms_threshold
+        )
+    except Exception as e:
+        print(f"\n✗ 初始化 estimator 失败: {e}")
+        return
+
+    print(f"\n[HTTP] 启动合并服务器 ...")
+    # ★ Bug 修复: V2 进程内必须显式注入狗控制 provider!
+    #   主文件 gimbal_pose_estimation_ascend.py 的 estimator.start_video_stream()
+    #   会设置 _http_dog_provider, 但 V2 是单独进程且启动时序不同
+    #   (HTTP server 在 start_video_stream 之前就启动, 浏览器请求 → provider=None
+    #   → 路由返回 "机器狗未连接", 表现为「点 🦿 初始化没反应, 必须去 V1 手动开」)
+    #   修复: 启动 HTTP 前就注入, 避免 race condition
+    try:
+        _gpea._http_dog_provider = estimator._handle_dog_action
+        print(f"  ✓ 狗控制 provider 已注入 (早于 HTTP 启动, 避免 race)")
+    except Exception as e:
+        print(f"  ⚠ 注入狗控制 provider 失败: {e}")
+    # ★ 关键: V2 启动时**主动**创建 dog 实例 + 静默起立
+    #   这样用户打开浏览器后狗已经 ready 且 _gait=None (腿不动, 适合拍 QR)
+    #   拍完 QR 后点 ↔ 执行横移 → 看到 _gait=None → 主动 start_motion + set_gait(行走) + move
+    #   解决了「用户必须先点 🦿 初始化, 否则 dog 实例为 None, 横移调用失败」的问题
+    try:
+        dog = estimator._get_dog()
+        ip = getattr(estimator, '_dog_ip', '?')
+        print(f"  ✓ dog 实例已主动创建: ip={ip}, addr={dog._addr}")
+        # ★ 启动时测试 UDP socket 是否能联通 (1字节 HEARTBEAT 探测)
+        try:
+            from robot_interface import _HEARTBEAT
+            dog._sock.sendto(b'\x01\x00\x04\x21\x00\x00\x00\x00\x00\x00\x00\x00', dog._addr)
+            print(f"  ✓ UDP 探测包已发到 {dog._addr} (无异常 → 网络层 OK)")
+        except OSError as e:
+            print(f"  ✗ UDP 探测失败! 目标 {dog._addr} 不通: {e}")
+            print(f"  ⚠ 狗 IP/网线/防火墙可能有问题, 横移不会动!")
+        print(f"  [V2.init] 主动调 dog.stand_quiet() (起立+手动+力控, 腿不动 ≈2.5s) ...")
+        dog.stand_quiet()
+        print(f"  ✓ 静默起立完成: ready=True, gait=None (腿保持静止, 可直接拍 QR)")
+    except Exception as e:
+        import traceback
+        print(f"  ⚠ V2 启动时静默起立失败: {e}")
+        print(f"  {traceback.format_exc()}")
+        print(f"  → 用户可手动点 '🦿 静默起立' 按钮重试")
+    start_combined_http_stream(port=args.port, owner=estimator)
+    _qrnav_dog_port_holder[0] = args.port
+    _qrnav_estimator_holder[0] = estimator
+    try:
+        estimator.qr_size = float(_QR_NAV_CFG.get("QR_SIZE_M", 0.12))
+        print(f"  QR 物理尺寸已强制统一: {estimator.qr_size:.3f} m")
+    except Exception as _e:
+        print(f"  ⚠ 强制 qr_size 失败: {_e}")
+    print(f"  云台控制台:    http://0.0.0.0:{args.port}/")
+    print(f"  V2 两段式:     http://0.0.0.0:{args.port}/qr_nav2     ← 本文件新增")
+    print(f"  V1 兼容路由:   http://0.0.0.0:{args.port}/qr_nav/*  (HTML 在 V1 文件)")
+    print(f"  合并页面:      http://0.0.0.0:{args.port}/qr_nav2_index")
+
+    estimator._http_stream_started = True
+    estimator._http_port = args.port
+
+    stop_evt = threading.Event()
+    sync_t = threading.Thread(
+        target=_qrnav_pose_sync_loop, args=(estimator, stop_evt), daemon=True)
+    sync_t.start()
+    print(f"  QR 同步线程已启动")
+
+    if float(_QR_NAV_CFG.get("LIVE_POSE_FPS", 0.0) or 0.0) > 0:
+        live_t = threading.Thread(
+            target=_qrnav_live_pose_loop, args=(estimator, stop_evt),
+            daemon=True)
+        live_t.start()
+        print(f"  实时位姿线程已启动 "
+              f"({_QR_NAV_CFG['LIVE_POSE_FPS']:.1f} fps)")
+
+    print(f"\n[VIDEO] 启动视频流 ...")
+    if args.mode == 'video' or args.video or args.display_pose:
+        estimator.start_video_stream(display_pose=True)
+        try:
+            while estimator.video_running:
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            print("\n用户中断")
+        finally:
+            stop_evt.set()
+            estimator.stop_video_stream()
+            estimator.cleanup()
+    else:
+        print(f"  当前 mode={args.mode}, 视频流未启动")
+        try:
+            while True:
+                time.sleep(1.0)
+        except KeyboardInterrupt:
+            print("\n用户中断")
+        finally:
+            stop_evt.set()
+            estimator.cleanup()
+
+
+if __name__ == "__main__":
+    main()

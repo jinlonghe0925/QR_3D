@@ -20,6 +20,7 @@
 
 import socket
 import struct
+import math
 from time import sleep
 
 # ======================= 配置（按需修改） =======================
@@ -167,7 +168,8 @@ class Dog:
         self._gait = gait
         print(f"[Dog] 步态已切换: 0x{gait:08X}")
 
-    def move(self, x=0.0, y=0.0, z=0.0, max_move_m=None, max_turn_deg=None, hz=STREAM_HZ):
+    def move(self, x=0.0, y=0.0, z=0.0, max_move_m=None, max_turn_deg=None, hz=STREAM_HZ,
+             stop_after=True, lateral_speed_mps=None):
         """按距离/角度移动，三轴等比例调速同时到达
 
         Args:
@@ -177,9 +179,11 @@ class Dog:
             max_move_m:  单次平移安全上限 (米), None=不限。超出直接拒绝 (返回 False)
             max_turn_deg: 单次旋转安全上限 (度), None=不限
             hz: 轴指令流式下发频率 (默认 20Hz)
+            stop_after: 本次结束后发零速帧；连续分段时由调用者在最后统一停止
+            lateral_speed_mps: 当前 gait 满摇杆侧移速度 (m/s)，None 使用 VMAX_Y
 
         Returns:
-            True=已执行, False=被安全锁拒绝 (未执行任何动作)
+            True=指令流已发送完毕 (不代表实测位移到位), False=被安全锁拒绝
 
         Note:
             move 是阻塞调用，完成移动后才返回。
@@ -195,18 +199,23 @@ class Dog:
             print(f"[Dog] ✗ 旋转量超限: |z|={abs(z):.1f} > {max_turn_deg}°")
             return False
 
+        lateral_speed = VMAX_Y if lateral_speed_mps is None else float(lateral_speed_mps)
+        if not math.isfinite(lateral_speed) or lateral_speed <= 0:
+            raise ValueError("侧移标定速度必须为正的有限数值 (m/s)")
         tx = abs(x) / VMAX_X if abs(x) > 1e-6 else 0
-        ty = abs(y) / VMAX_Y if abs(y) > 1e-6 else 0
+        ty = abs(y) / lateral_speed if abs(y) > 1e-6 else 0
         tz = abs(z) / VMAX_Z if abs(z) > 1e-6 else 0
         t = max(tx, ty, tz)
         if t < 0.01:
             return True
 
         vx = max(-1, min(1, (x / VMAX_X) / t)) if tx > 0 else 0
-        vy = max(-1, min(1, (y / VMAX_Y) / t)) if ty > 0 else 0
+        vy = max(-1, min(1, (y / lateral_speed) / t)) if ty > 0 else 0
         vz = max(-1, min(1, (z / VMAX_Z) / t)) if tz > 0 else 0
 
-        self.stream(vx=vx, vy=vy, vz=vz, duration=t, hz=hz)
+        print(f"[Dog] 距离指令: x={x:+.3f}m y={y:+.3f}m z={z:+.1f}°, "
+              f"侧移标定速度={lateral_speed:.3f}m/s, 计划时长={t:.3f}s")
+        self.stream(vx=vx, vy=vy, vz=vz, duration=t, hz=hz, stop_after=stop_after)
         return True
 
     def stream(self, vx=0.0, vy=0.0, vz=0.0, duration=1.0, hz=STREAM_HZ,
@@ -222,7 +231,10 @@ class Dog:
         """
         hz = max(1.0, float(hz))
         period = 1.0 / hz
-        n = max(1, int(round(float(duration) * hz)))
+        duration = float(duration)
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError("指令流持续时间必须为正的有限数值")
+        n = max(1, int(math.ceil(duration * hz)))
         hb_every = int(round(hz / hb_hz)) if hb_hz and hb_hz > 0 else 0
         a = int(max(-1.0, min(1.0, vx)) * AXIS_MAX)
         b = int(max(-1.0, min(1.0, vy)) * AXIS_MAX)
@@ -242,7 +254,8 @@ class Dog:
                 self._send(_AXIS_RX, c)
             if hb_every and i % hb_every == 0:
                 self._send(_HEARTBEAT, 0, debug=True)
-            sleep(period)
+            # 最后一帧只保持剩余时长，避免每段按帧数取整后累计丢失距离。
+            sleep(min(period, max(0.0, duration - i * period)))
         # 流结束再发 1 次 heartbeat, 让运控识别"流结束"
         self._send(_HEARTBEAT, 0, debug=True)
         if stop_after:

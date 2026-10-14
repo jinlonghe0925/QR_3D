@@ -51,6 +51,9 @@ class GimbalController:
         self._focal_length_value = None  # 存储查询到的焦距值（mm）
         self._fov_x_value = None  # 存储查询到的水平视场角（度）
         self._fov_y_value = None  # 存储查询到的垂直视场角（度）
+        self._zoom_magnification_value = None  # 状态包回读的实际倍率
+        self._requested_zoom_mag = None         # 最近一次 0x0B 指令目标倍率
+        self._last_zoom_command_ts = 0.0
         self._focal_length_x = None  # 物理焦距 x（mm）
         self._focal_length_y = None  # 物理焦距 y（mm）
         self._focal_length_raw = None  # 最近一次 FOV 查询响应的原始字节 (调试用)
@@ -392,6 +395,8 @@ class GimbalController:
         """
         body = bytes([0x0B]) + struct.pack("!f", mag) + b"\x00" * 5
         self._send_cmd(fid=0x01, body=body)
+        self._requested_zoom_mag = float(mag)
+        self._last_zoom_command_ts = time.time()
         logger.info(f"变倍到指定倍率: {mag}x")
 
     def auto_focus(self):
@@ -449,8 +454,11 @@ class GimbalController:
                     focal_length = self._focal_length_value
                     fov_x = self._fov_x_value
                     fov_y = self._fov_y_value
+                    zoom_mag = self._zoom_magnification_value
                 print(f"✓ fov_x: {fov_x:.1f}°, fov_y: {fov_y:.1f}°")
                 print(f"✓ focal_length_x: {focal_length:.1f}mm, focal_length_y: {focal_length:.1f}mm")
+                if zoom_mag is not None:
+                    print(f"✓ zoom_magnification: {zoom_mag:.1f}x")
                 self._fov_debug = False
                 return fov_x, fov_y, focal_length, focal_length
 
@@ -544,6 +552,9 @@ class GimbalController:
                         fov_l = data[6]
                         fov_x_raw = (fov_h << 8) | fov_l
                         self._fov_x_value = fov_x_raw / 10.0  # 水平视场角（度）
+                        # 解析实际变倍倍率 (字节7-8, 有效值×10)
+                        zoom_raw = (data[7] << 8) | data[8]
+                        self._zoom_magnification_value = zoom_raw / 10.0
                         # 计算垂直视场角 (假设图像宽高比为16:9)
                         # fov_y = 2 * arctan(tan(fov_x/2) * (height/width))
                         import math

@@ -722,7 +722,13 @@ class GimbalPoseEstimator:
         self.current_frame = None           # 当前帧
         self.frame_lock = threading.Lock()  # 帧锁
         self.latest_pose_data = None       # 最新的位姿数据 (EMA 平均值)
+        # 每次 PnP 前实时查询 FOV；查询串行化，避免多线程同时清除/等待同一个事件。
+        # 偶发超时时复用本进程最近一次真实回读，不直接跳回固定 60°。
+        self._fov_query_lock = threading.Lock()
+        self._last_valid_fov = None        # (fov_x, fov_y, focal_x, focal_y, ts)
+        self._pose_intrinsics_snapshot = None  # 一次多帧 Pose 共用同一份 FOV/内参
         self._first_pose_data = None        # 首帧原始位姿 (单帧, 用于 [c] 旋转, 与 QR_3D auto_aim 一致)
+        self._review_pose_data = None       # 页面1投影专用: 必须与 review 图像来自同一帧
         self.pose_records = []             # 位姿记录 (网页 3D 显示用)
         self.gimbal_step = 5.0             # 云台网页微调步长 (度)
         self.show_pose_on_video = False    # 是否在视频上显示位姿信息
@@ -860,6 +866,205 @@ class GimbalPoseEstimator:
                 print(f"  [ACL] ✓ 检测器已绑定线程 {threading.get_ident()} "
                       f"(该线程后续所有推理复用此模型)")
         return det
+
+    def _resolve_pose_camera_matrix(self, image_width, image_height):
+        """为一次 Pose 计算实时获取 FOV，并构造本次专用相机内参。
+
+        Returns:
+            (camera_matrix, fov_x, fov_y, focal_x, focal_y, source, timestamp)
+        """
+        width, height = int(image_width), int(image_height)
+        snapshot = getattr(self, "_pose_intrinsics_snapshot", None)
+        if snapshot is not None:
+            snap_w, snap_h, values = snapshot
+            if int(snap_w) == width and int(snap_h) == height:
+                return values
+
+        override = getattr(self, "_override_camera_matrix", None)
+        if override is not None:
+            camera_matrix = np.asarray(override, dtype=np.float64)
+            fx, fy = float(camera_matrix[0, 0]), float(camera_matrix[1, 1])
+            fov_x = 2.0 * math.degrees(math.atan(width / (2.0 * fx)))
+            fov_y = 2.0 * math.degrees(math.atan(height / (2.0 * fy)))
+            return (camera_matrix, fov_x, fov_y, None, None,
+                    "camera_intrinsics_override", time.time())
+
+        lock = getattr(self, "_fov_query_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._fov_query_lock = lock
+
+        values = (None, None, None, None)
+        try:
+            # GimbalController 的 FOV 查询共用同一个 Event/返回值，必须完整串行。
+            with lock:
+                try:
+                    values = self.gimbal.query_focal_length(timeout=2.0)
+                except TypeError:
+                    # 兼容旧版/测试版 gimbal 接口没有 timeout 关键字。
+                    values = self.gimbal.query_focal_length()
+        except Exception as exc:
+            print(f"  ⚠ 实时 FOV 查询异常: {exc}")
+
+        fov_x, fov_y, focal_x, focal_y = values
+        valid = False
+        try:
+            # 协议状态包的有效测量是水平 FOV；垂直 FOV 在下方按图像尺寸推算。
+            valid = (math.isfinite(float(fov_x))
+                     and 0.5 < float(fov_x) < 179.0)
+        except (TypeError, ValueError):
+            valid = False
+
+        now = time.time()
+        if valid:
+            fov_x = float(fov_x)
+            # 协议只返回水平 FOV；按本帧实际宽高比重算垂直 FOV。
+            fov_y = math.degrees(2.0 * math.atan(
+                math.tan(math.radians(fov_x) / 2.0)
+                * height / max(1.0, float(width))))
+            focal_x = float(focal_x) if focal_x is not None else None
+            focal_y = float(focal_y) if focal_y is not None else None
+            self._last_valid_fov = (fov_x, fov_y, focal_x, focal_y, now)
+            source = "gimbal_realtime"
+            sample_ts = now
+        else:
+            last = getattr(self, "_last_valid_fov", None)
+            if last is not None:
+                fov_x, fov_y, focal_x, focal_y, sample_ts = last
+                fov_y = math.degrees(2.0 * math.atan(
+                    math.tan(math.radians(fov_x) / 2.0)
+                    * height / max(1.0, float(width))))
+                source = "gimbal_last_valid"
+                print(f"  ⚠ 本次 FOV 查询失败，复用最近真实值: "
+                      f"fov_x={fov_x:.2f}°, fov_y={fov_y:.2f}°")
+            else:
+                fov_x = float(self.fov_x)
+                fov_y = math.degrees(2.0 * math.atan(
+                    math.tan(math.radians(fov_x) / 2.0)
+                    * height / max(1.0, float(width))))
+                focal_x = focal_y = None
+                source = "configured_default"
+                sample_ts = now
+                print(f"  ⚠ 尚无真实 FOV，使用配置值: "
+                      f"fov_x={fov_x:.2f}°, fov_y={fov_y:.2f}°")
+
+        camera_matrix = pose_estimation.create_camera_matrix(
+            (width, height), fov_x=fov_x, fov_y=fov_y)
+        return (camera_matrix, fov_x, fov_y, focal_x, focal_y,
+                source, sample_ts)
+
+    def _prepare_pose_intrinsics_snapshot(self, image_width, image_height,
+                                          sample_count=6):
+        """为一次多帧 Pose 锁定内参。
+
+        云台变倍状态与 RTSP 图像并非严格同时到达。这里先连续读取真实 FOV，
+        对有效样本取中位数，再让本次多帧 PnP 全部使用同一矩阵，避免把不同
+        焦距尺度的三维位置混合到一个结果中。
+        """
+        width, height = int(image_width), int(image_height)
+        self._pose_intrinsics_snapshot = None
+        samples = []
+        fallback = None
+
+        zoom_ready = True
+        fov_stable = False
+        actual_zoom = None
+        requested_zoom = getattr(self.gimbal, "_requested_zoom_mag", None)
+        zoom_command_ts = float(getattr(
+            self.gimbal, "_last_zoom_command_ts", 0.0) or 0.0)
+        stale_after_zoom = False
+        for index in range(max(1, int(sample_count))):
+            values = self._resolve_pose_camera_matrix(width, height)
+            fallback = values
+            source = values[5]
+            actual_zoom = getattr(
+                self.gimbal, "_zoom_magnification_value", None)
+            zoom_ready = True
+            if requested_zoom is not None and actual_zoom is not None:
+                zoom_ready = abs(float(actual_zoom) - float(requested_zoom)) <= 0.15
+            if source == "camera_intrinsics_override":
+                samples = [values]
+                fov_stable = True
+                break
+            if source == "gimbal_realtime":
+                samples.append(values)
+            else:
+                # 变倍指令之后不能复用变倍前的旧 FOV，否则距离尺度必然错误。
+                stale_after_zoom = (zoom_command_ts > 0.0 and (
+                    source == "configured_default"
+                    or (source == "gimbal_last_valid"
+                        and (float(values[6]) < zoom_command_ts
+                             or not zoom_ready))))
+                if stale_after_zoom and index + 1 < sample_count:
+                    time.sleep(0.15)
+                    continue
+                # 普通超时可用最近真实值；没有新值时不再累计等待。
+                if not stale_after_zoom:
+                    break
+            # 至少三个连续样本；FOV 极差足够小且实际倍率已到目标才算稳定。
+            if len(samples) >= 3:
+                recent_fovs = [float(item[1]) for item in samples[-3:]]
+                stable_tol = max(0.10, float(np.median(recent_fovs)) * 0.003)
+                if max(recent_fovs) - min(recent_fovs) <= stable_tol and zoom_ready:
+                    samples = samples[-3:]
+                    fov_stable = True
+                    break
+            if index + 1 < sample_count:
+                time.sleep(0.15)
+
+        if samples:
+            # 若达到最大等待次数时仍在缓慢变化，只采用最新三次，避免早期旧焦距
+            # 样本把最终内参拉回去。
+            if len(samples) > 3:
+                samples = samples[-3:]
+            fov_values = [float(item[1]) for item in samples]
+            fov_x = float(np.median(fov_values))
+            fov_y = math.degrees(2.0 * math.atan(
+                math.tan(math.radians(fov_x) / 2.0)
+                * height / max(1.0, float(width))))
+            focal_x_values = [float(item[3]) for item in samples
+                              if item[3] is not None]
+            focal_y_values = [float(item[4]) for item in samples
+                              if item[4] is not None]
+            focal_x = (float(np.median(focal_x_values))
+                       if focal_x_values else None)
+            focal_y = (float(np.median(focal_y_values))
+                       if focal_y_values else None)
+            sample_ts = max(float(item[6]) for item in samples)
+            source = ("camera_intrinsics_override" if len(samples) == 1
+                      and samples[0][5] == "camera_intrinsics_override"
+                      else "gimbal_capture_median")
+            camera_matrix = pose_estimation.create_camera_matrix(
+                (width, height), fov_x=fov_x, fov_y=fov_y)
+            values = (camera_matrix, fov_x, fov_y, focal_x, focal_y,
+                      source, sample_ts)
+            spread = max(fov_values) - min(fov_values)
+            zoom_text = ""
+            if actual_zoom is not None:
+                zoom_text = f", 实际倍率={float(actual_zoom):.1f}x"
+            if requested_zoom is not None:
+                zoom_text += f", 目标倍率={float(requested_zoom):.1f}x"
+            if fov_stable and zoom_ready:
+                stable_text = "稳定"
+                log_mark = "✓"
+            elif not zoom_ready:
+                stable_text = "倍率未完全到位"
+                log_mark = "⚠"
+            else:
+                stable_text = "FOV仍有波动"
+                log_mark = "⚠"
+            print(f"  {log_mark} 本次捕获锁定 FOV: {fov_x:.2f}° "
+                  f"({len(samples)}次实时采样, 极差={spread:.2f}°, "
+                  f"{stable_text}{zoom_text})")
+        elif fallback is not None and not stale_after_zoom:
+            values = fallback
+            print(f"  ⚠ 本次捕获使用 FOV 兜底值: {values[1]:.2f}° "
+                  f"source={values[5]}")
+        else:
+            raise RuntimeError("变倍后未读到新的真实 FOV，本次 Pose 已取消")
+
+        self._pose_intrinsics_snapshot = (width, height, values)
+        return values
 
     def estimate_pose_from_image(self, image_path, debug=True, debug_dir=None):
         """
@@ -1133,29 +1338,13 @@ class GimbalPoseEstimator:
         print(f"二维码实际尺寸...", self.qr_size)
         object_points = pose_estimation.define_qr_object_points(qr_size=self.qr_size)
         
-        # 查询当前焦距和视场角，用于计算相机内参矩阵
-        # 如果有 _override_camera_matrix（来自 camera_intrinsics.txt），直接使用
-        if hasattr(self, '_override_camera_matrix') and self._override_camera_matrix is not None:
-            H, W = image.shape[:2]
-            camera_matrix = self._override_camera_matrix
-            fov_x, fov_y, focal_x, focal_y = None, None, None, None
-            print(f"  使用 camera_intrinsics.txt 中的内参矩阵（跳过云台查询）")
-            # 保存相机内参到实例，供 auto_aim 等后续步骤从 fx 反算 FOV
-            self.camera_matrix = camera_matrix
-        else:
-            print(f"\n  2.5.1 查询当前焦距和视场角...")
-            fov_x, fov_y, focal_x, focal_y = self.gimbal.query_focal_length()
-            if fov_x is not None and fov_y is not None:
-                print(f"  ✓ 查询成功: fov_x={fov_x:.1f}°, fov_y={fov_y:.1f}°, focal_x={focal_x:.1f}mm, focal_y={focal_y:.1f}mm")
-                # 使用查询到的视场角创建相机内参矩阵
-                H, W = image.shape[:2]
-                camera_matrix = pose_estimation.create_camera_matrix((W, H), fov_x=fov_x, fov_y=fov_y)
-            else:
-                # 查询失败: 按最初版本回退到默认 fov_x (云台未返回真实数据)
-                print(f"  ⚠ 查询失败，使用默认fov_x={self.fov_x}°")
-                print(f"  ⚠⚠ 焦距不准确！当前为默认视场角，非云台真实数据，变倍后角度计算会有较大误差")
-                H, W = image.shape[:2]
-                camera_matrix = pose_estimation.create_camera_matrix((W, H), fov_x=self.fov_x)
+        # 每一帧 Pose 都实时查询一次云台 FOV；查询失败时复用最近一次真实回读。
+        H, W = image.shape[:2]
+        print(f"\n  2.5.1 实时查询本帧焦距和视场角...")
+        (camera_matrix, fov_x, fov_y, focal_x, focal_y,
+         fov_source, fov_sample_ts) = self._resolve_pose_camera_matrix(W, H)
+        print(f"  ✓ 本帧内参: fov_x={fov_x:.2f}°, fov_y={fov_y:.2f}°, "
+              f"source={fov_source}")
         # 保存相机内参到实例，供 auto_aim 等后续步骤从 fx 反算 FOV
         self.camera_matrix = camera_matrix
         
@@ -1215,7 +1404,15 @@ class GimbalPoseEstimator:
             'qr_size': self.qr_size,                  # 二维码尺寸（米）
             'image_points': points_corrected,          # 图像角点
             'object_points': object_points,            # 二维码3D角点（世界坐标系）
-            'camera_matrix': camera_matrix             # 相机内参矩阵
+            'camera_matrix': camera_matrix,            # 相机内参矩阵
+            'img_w': int(W),
+            'img_h': int(H),
+            'fov_x': float(fov_x),
+            'fov_y': float(fov_y),
+            'focal_x_mm': focal_x,
+            'focal_y_mm': focal_y,
+            'fov_source': fov_source,
+            'fov_sample_ts': float(fov_sample_ts),
         }
         
         # 绘制结果图像
@@ -1261,7 +1458,7 @@ class GimbalPoseEstimator:
         print(f"\n【旋转向量】 (rvec)")
         print(f"  [{pose_data['rvec'][0]:.6f}, {pose_data['rvec'][1]:.6f}, {pose_data['rvec'][2]:.6f}]")
         
-        print(f"\n【平移向量】 (tvec) - 相机在二维码坐标系中的位置")
+        print(f"\n【平移向量】 (tvec) - 二维码原点在相机坐标系中的位置 (X右/Y下/Z前)")
         print(f"  X: {pose_data['tvec'][0]:.6f} 米")
         print(f"  Y: {pose_data['tvec'][1]:.6f} 米")
         print(f"  Z: {pose_data['tvec'][2]:.6f} 米")
@@ -2165,8 +2362,9 @@ class GimbalPoseEstimator:
                     detection_frame = self.review_frame_with_yolo.copy()
 
                     # 在 detection 窗口上绘制坐标轴
-                    if self.show_pose_on_video and self.latest_pose_data is not None:
-                        pose_data = self.latest_pose_data
+                    pose_data = (getattr(self, '_review_pose_data', None)
+                                 or getattr(self, '_first_pose_data', None))
+                    if self.show_pose_on_video and pose_data is not None:
                         try:
                             H, W = detection_frame.shape[:2]
                             # 关键: 必须用 PnP 时用的同一份 camera_matrix, 否则
@@ -2178,7 +2376,7 @@ class GimbalPoseEstimator:
                                 camera_matrix = pose_estimation.create_camera_matrix((W, H), fov_x=self.fov_x)
                             dist_coeffs = np.zeros((5, 1), dtype=np.float32)
 
-                            # 使用最新的位姿数据绘制坐标轴
+                            # 使用与 review 图像同帧的原始位姿绘制坐标轴
                             if 'rvec' in pose_data and 'tvec' in pose_data:
                                 rvec = pose_data['rvec'].reshape(3, 1)
                                 tvec = pose_data['tvec'].reshape(3, 1)
@@ -2340,6 +2538,7 @@ class GimbalPoseEstimator:
                 print(f"✗ 位姿估计异常: {e}")
                 _set_panel_status(f"位姿估计失败: {e}")
             finally:
+                self._pose_intrinsics_snapshot = None
                 self._est_busy = False
     
     def _capture_and_estimate(self, frame):
@@ -2359,7 +2558,39 @@ class GimbalPoseEstimator:
         print(f"多帧位姿采集 (窗口={window_size}帧, EMA α={alpha})")
         print(f"{'='*50}")
 
+        # 每次点击捕获都是一次独立测量。不能把上一次焦距下的距离通过 EMA
+        # 带入本次，否则同一位置仅改变变倍也会出现明显的历史滞后。
+        self._pose_history.clear()
+
+        # 先稳定读取并锁定本次捕获的 FOV。随后等待 RTSP 至少更新一帧，避免
+        # “新 FOV + 变倍前旧画面”的时间错配。
+        prepare_intrinsics = getattr(self, '_prepare_pose_intrinsics_snapshot', None)
+        if callable(prepare_intrinsics):
+            try:
+                prepare_intrinsics(int(frame.shape[1]), int(frame.shape[0]))
+            except Exception as exc:
+                print(f"  ✗ 锁定本次 FOV 失败: {exc}")
+                self._pose_intrinsics_snapshot = None
+                _set_panel_status(f"位姿估计取消: {exc}")
+                return
+
+        grab_fresh = getattr(self, '_grab_fresh_frame', None)
+        if callable(grab_fresh) and self._pose_intrinsics_snapshot is not None:
+            try:
+                sync_ts = time.time() + 0.60
+                synced_frame = grab_fresh(
+                    settle=0.60, min_ts=sync_ts, timeout=2.0)
+                if synced_frame is not None:
+                    frame = synced_frame
+                    print("  ✓ 已切换到 FOV 回读后的新 RTSP 帧")
+                else:
+                    print("  ⚠ 等待新 RTSP 帧超时，使用触发时画面")
+            except Exception as exc:
+                print(f"  ⚠ RTSP/FOV 同步失败，使用触发时画面: {exc}")
+
         raw_poses = []  # [(pose_data, confidence, is_success), ...]
+        first_valid_frame = None
+        first_valid_result = None
 
         # ── 阶段 1: 连续采集 window_size 帧 (从读帧线程取最新帧, 不抢 RTSP) ──
         for i in range(window_size):
@@ -2379,15 +2610,28 @@ class GimbalPoseEstimator:
             temp_path = os.path.join(self.output_dir, f"temp_capture_{i}.jpg")
             cv2.imwrite(temp_path, frame_i)
 
-            success, pose_data, _ = self.estimate_pose_from_image(temp_path, debug=False)
+            success, pose_data, pose_result = self.estimate_pose_from_image(
+                temp_path, debug=False)
             if success and pose_data is not None:
                 conf = float(pose_data.get("confidence", 0.5))
                 raw_poses.append((pose_data, conf, True))
+                if first_valid_frame is None:
+                    # 页面1的图、rvec/tvec 和 camera_matrix 必须来自同一个有效帧。
+                    first_valid_frame = frame_i.copy()
+                    if pose_result is not None:
+                        first_valid_result = pose_result.copy()
                 print(f"    帧 {i+1}: ✓ conf={conf:.3f} "
-                      f"pos=({pose_data['camera_position'][0]:.2f},{pose_data['camera_position'][1]:.2f},{pose_data['camera_position'][2]:.2f})")
+                      f"FOV={pose_data.get('fov_x', 0.0):.2f}° "
+                      f"dist={pose_data.get('distance', 0.0):.4f}m "
+                      f"pos=({pose_data['camera_position'][0]:.3f},"
+                      f"{pose_data['camera_position'][1]:.3f},"
+                      f"{pose_data['camera_position'][2]:.3f})")
             else:
                 raw_poses.append((None, 0.0, False))
                 print(f"    帧 {i+1}: ✗ 位姿估计失败")
+
+        # 本次窗口结束后立即释放快照；下一次捕获必须重新读取实时 FOV。
+        self._pose_intrinsics_snapshot = None
 
         # ── 阶段 2: 过滤 & 平滑 ──
         valid = [(p, c) for p, c, ok in raw_poses if ok]
@@ -2437,6 +2681,8 @@ class GimbalPoseEstimator:
         # 构建平滑后的 pose_data（使用第一个有效帧的其他字段）
         base_pose = valid[0][0].copy()
         base_pose["camera_position"] = fused_pos.tolist()
+        # camera_position 平滑后同步更新 tvec，避免导航用首帧 tvec、输出用融合位置。
+        base_pose["tvec"] = (-np.asarray(base_pose["rmat"]) @ fused_pos).reshape(3)
         base_pose["yaw"] = float(fused_yaw)
         base_pose["pitch"] = float(fused_pitch)
         base_pose["roll"] = float(fused_roll)
@@ -2460,6 +2706,7 @@ class GimbalPoseEstimator:
         #   - 只取第一帧, 相当于『对原始帧做单帧 PnP』
         try:
             self._first_pose_data = valid[0][0].copy()
+            self._review_pose_data = valid[0][0].copy()
         except Exception:
             pass
 
@@ -2483,8 +2730,14 @@ class GimbalPoseEstimator:
 
         # ── 阶段 3: 打印 & 保存 ──
         std_pos = np.std(positions, axis=0) if len(positions) > 1 else np.zeros(3)
+        raw_distances = np.array([float(p.get("distance", 0.0))
+                                  for p, _ in valid], dtype=float)
+        distance_std = float(np.std(raw_distances)) if len(raw_distances) > 1 else 0.0
+        base_pose["raw_distance_std"] = distance_std
         print(f"\n  窗口统计 ({success_count}/{window_size} 有效):")
         print(f"    位置 STD: X={std_pos[0]:.4f} Y={std_pos[1]:.4f} Z={std_pos[2]:.4f} m")
+        print(f"    单帧距离: min={raw_distances.min():.4f}m "
+              f"max={raw_distances.max():.4f}m STD={distance_std:.4f}m")
         print(f"    融合后位置: X={fused_pos[0]:.4f} Y={fused_pos[1]:.4f} Z={fused_pos[2]:.4f} m")
         print(f"    融合后角度: Yaw={fused_yaw:.2f}° Pitch={fused_pitch:.2f}° Roll={fused_roll:.2f}°")
 
@@ -2492,16 +2745,15 @@ class GimbalPoseEstimator:
 
         timestamp = int(time.time())
         output_prefix = os.path.join(self.output_dir, f"video_pose_{timestamp}")
-        # 用第一帧画结果图
-        temp_first = os.path.join(self.output_dir, "temp_capture_0.jpg")
-        result_image = cv2.imread(temp_first)
+        # 保存与首个有效单帧 Pose 严格对应的投影图，不能套用融合后的 tvec。
+        result_image = first_valid_result
         if result_image is not None:
-            self.save_result(result_image, base_pose, output_prefix)
+            self.save_result(result_image, self._review_pose_data, output_prefix)
 
         print(f"\n✓ 多帧位姿估计完成 ({success_count}/{window_size} 帧有效)")
 
         # 启动 review 模式
-        saved_frame = cv2.imread(temp_first)
+        saved_frame = first_valid_frame
         if saved_frame is not None:
             self._start_review_mode(saved_frame)
     
@@ -2581,7 +2833,10 @@ class GimbalPoseEstimator:
                     global _http_aligned_jpg, _http_aligned_ver, _http_aligned_msg
 
                     Hh, Ww = frame_with_yolo.shape[:2]
-                    pd = getattr(self, 'latest_pose_data', None)
+                    # 页面1检测图使用该图像对应的原始单帧 Pose。多帧融合 Pose
+                    # 只供导航数值使用，不能投影回这张原始图。
+                    pd = (getattr(self, '_review_pose_data', None)
+                          or getattr(self, '_first_pose_data', None))
 
                     # (1) 检测结果图 = YOLO 框 + 位姿坐标轴
                     detect_img = frame_with_yolo.copy()
