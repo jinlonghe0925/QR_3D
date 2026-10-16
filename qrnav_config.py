@@ -55,6 +55,9 @@ _QR_NAV_CFG = {
     # 现场实测方向：相机位置 X>0 → 右移，X<0 → 左移。
     "LATERAL_SIGN":   +1,
     "YAW_SIGN":       +1,
+    "INITIAL_TURN_SIGN": +1,       # Pose水平偏角正值→狗右转（z正），不使用横移符号
+    "INITIAL_YAW_TOL_DEG": 2.0,   # 模块1水平朝向容差
+    "INITIAL_TURN_STEP_DEG": 30.0,# 模块1单段转向上限，沿用狗的转向限制
     "ZOOM_TARGET":    0.15,
     "STREAM_SCALE":   0.50,
     "STREAM_QUALITY": 60,

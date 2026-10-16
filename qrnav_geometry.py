@@ -27,8 +27,8 @@ def _get_gimbal_angles():
         gimbal = getattr(est, "gimbal", None)
         if gimbal is None:
             return 0.0, 0.0, 0.0
-        ya, yp, _ = gimbal.get_current_angles()
-        return float(ya), float(yp), 0.0
+        ya, yp, yr = gimbal.get_current_angles()
+        return float(ya), float(yp), float(yr)
     except Exception:
         return 0.0, 0.0, 0.0
 

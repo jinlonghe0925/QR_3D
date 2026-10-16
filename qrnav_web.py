@@ -12,7 +12,7 @@ import gimbal_pose_estimation_ascend as _gpea
 
 from qrnav_config import (
     _QR_NAV_CFG, _qrnav_pose_lock, _qrnav_pose_box, _qrnav_poll_busy,
-    _qrnav_jpg_buf, _qrnav_estimator_holder,
+    _qrnav_jpg_buf, _qrnav_estimator_holder, _qrnav_pose_ver,
 )
 from qrnav_geometry import pose_to_command
 from qrnav_dogctl import (
@@ -24,11 +24,26 @@ from qrnav_phases import (
     mark_dog_ready, reset_phase,
     _is_af_running, _set_af_status, _auto_full_worker,
     _qrnav_auto_full_status,
+    _do_capture_once,
 )
+from qrnav_initial import InitialLocalization
 from qrnav_steps import (
     lateral_step_only, zoom_step_only, auto_step_nav,
     align_step_nav, exec_plan_step,
 )
+
+
+def _invalidate_navigation_after_initial_turn():
+    reset_phase()
+    with _qrnav_pose_lock:
+        _qrnav_pose_box[0] = None
+        _qrnav_pose_ver[0] += 1
+
+
+_initial_localization = InitialLocalization(
+    lambda name: _do_capture_once(name, align_gimbal=False),
+    lambda: _qrnav_estimator_holder[0], lambda: _QR_NAV_CFG,
+    _invalidate_navigation_after_initial_turn)
 
 # ============================================================
 #  HTML — V2 页面 (5 步走, 状态条 + 阶段指示)
@@ -94,6 +109,24 @@ HTML_QR_NAV2_PAGE = r"""<!DOCTYPE html>
    <a href="/qr_nav" style="font-size:11px">← V1 页面</a></h3>
 
 <!-- ============= ✨ ▶ 一键完成 (主入口, 单按钮跑完整 6 段) ============= -->
+<div class="panel" style="border:2px solid #0cf;margin-bottom:10px">
+  <h3 style="color:#0cf">模块1 · 初始定位 / 朝向对齐</h3>
+  <div class="hint">初始云台与狗同向。捕获Pose后，将二维码平面法线投影到相机XZ平面，与视平面法线（相机Z轴）比较，计算绕相机Y轴的偏角；只转狗，不平移、不调整云台。俯仰方向的倾斜不在本步骤调整范围内。</div>
+  <div class="row2">
+    <button id="b_initial_gimbal" class="btn-block" style="width:100%;background:#7652ad"
+      onclick="initialAction('gimbal_init')">初始化云台（0° / 0° / 0°）</button>
+  </div>
+  <div class="row2">
+    <button id="b_initial_capture" class="btn-block" style="width:48%;background:#0a6"
+      onclick="initialAction('capture')">📸 捕获初始Pose</button>
+    <button id="b_initial_execute" class="btn-block" style="width:48%;background:#08f" disabled
+      onclick="initialAction('execute')">↻ 执行朝向对齐</button>
+  </div>
+  <div id="initial_plan" class="summary">尚未捕获初始Pose</div>
+  <div id="initial_msg" class="msg">执行后请重新捕获复测；每份Pose只执行一次。安全前移将在后续加入。</div>
+  <div id="initial_result" class="hint"></div>
+</div>
+
 <div class="panel" style="background:linear-gradient(90deg,#001a33,#003366);
                           border:2px solid #4af;margin-bottom:8px;
                           padding:8px;border-radius:4px">
@@ -425,53 +458,28 @@ function dog(a){
   var lockMs    = _lock_ms_for(a);           // ★ 硬件完成才释放
   var isInitAct = (a=='stand'||a=='force'||a=='motion'||a=='start'||a=='stand_quiet');
   var isStopAct = (a=='stop' ||a=='down' ||a=='damp');
-  // ★ 关键: stand_quiet (V2 一键初始化) **不**追加 motion 链
-  //   静默起立后, 狗站着但腿不动, 适合拍 QR (无踏步抖动)
-  //   后续在 _move_lateral_steps 里会主动 start_motion + set_gait(行走)
-  //   旧 stand/init 路径 (V1 主页) 仍自动追加 motion 链, 不变
-  var needFollowupWalk = (a=='stand' || a=='init' || a=='connect');
+  // 模式准备由后端统一处理，前端每次点击只发一个请求。
   var gaitQuery = (a=='motion'||a=='start'||a=='start_motion'||a=='enable')
-                ? '&gait=0x21010301' : '';
+                ? '&gait=0x21010420' : '';
   dogBusy = true;
   var ms = document.querySelectorAll('.btn-dogm');
   ms.forEach(function(b){ b.disabled = true; });
   var e = document.getElementById('dog_msg');
   if (e) e.innerText = '⏳ 执行中: /dog/' + a + '?v=' + v + gaitQuery + ' ...';
-  log('→ /dog/' + a + '?v=' + v + gaitQuery + '  (锁 ' + (lockMs/1000).toFixed(1) + 's)' +
-      (needFollowupWalk ? '  → 后续将追加 motion?gait=0x21010301' : ''),
-      'info');
+  log('→ /dog/' + a + '?v=' + v + gaitQuery + '  (锁 ' + (lockMs/1000).toFixed(1) + 's)', 'info');
   fetch('/dog/' + a + '?v=' + v + gaitQuery)
     .then(function(r){ return r.text(); })
     .then(function(t){
       log('← /dog/' + a + '  ' + t,
           t.indexOf('✗')>=0 || t.indexOf('ERR')>=0 ? 'err' :
           (t.indexOf('⚠')>=0 ? 'warn' : 'ok'));
-      // 失败: 不再追加 walk
       if (t && (t.indexOf('✗') >= 0 || t.indexOf('ERR') >= 0)) {
-        if (e) e.innerText = t + '  (失败, 不再追加 walk)';
+        if (e) e.innerText = t;
         return { ok:false, t:t };
       }
       if (e) e.innerText = t + '  ⏳ 硬件稳定 ' + (lockMs/1000).toFixed(1) + 's';
-      if (!needFollowupWalk) {
-        pollDogState();
-        return { ok:true, t:t };
-      }
-      // ★ 自动追加 motion?gait=0x21010301 (切到行走 gait)
-      if (e) e.innerText += '\n  → 自动追加 motion?gait=0x21010301 (让狗切到行走 gait, 后续 move 才平移)';
-      log('→ /dog/motion?v=0&gait=0x21010301  (自动追加, 切行走 gait)', 'info');
-      return fetch('/dog/motion?v=0&gait=0x21010301')
-        .then(function(r2){ return r2.text(); })
-        .then(function(t2){
-          log('← /dog/motion?gait=0x21010301  ' + t2,
-              t2.indexOf('✗')>=0 || t2.indexOf('ERR')>=0 ? 'err' : 'ok');
-          if (t2 && (t2.indexOf('✗') >= 0 || t2.indexOf('ERR') >= 0)) {
-            if (e) e.innerText = '✗ 切行走 gait 失败: ' + t2;
-            return { ok:false, t:t, t2:t2 };
-          }
-          if (e) e.innerText = '✓ ' + t + ' + ✓ 切行走 gait → 准备就绪';
-          pollDogState();
-          return { ok:true, t:t, t2:t2 };
-        });
+      pollDogState();
+      return { ok:true, t:t };
     })
     .catch(function(err){
       if (e) e.innerText = '✗ 请求失败: ' + err + '  (立即释放锁)';
@@ -523,6 +531,46 @@ function checkDogConn(){
     if (e) e.innerText = '✗ /dog_msg 请求失败: ' + err;
   });
 }
+
+var initialBusy = false;
+async function pollInitial(){
+  try{
+    const r=await fetch('/qr_nav2/initial/state');
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const s=await r.json(), p=s.plan;
+    document.getElementById('initial_msg').textContent=s.message;
+    document.getElementById('b_initial_gimbal').disabled=initialBusy||['executing','capturing','initializing'].includes(s.stage);
+    document.getElementById('b_initial_capture').disabled=initialBusy||s.stage==='executing'||s.stage==='capturing';
+    document.getElementById('b_initial_execute').disabled=initialBusy||!s.can_execute;
+    const e=document.getElementById('initial_plan');
+    e.textContent=p ? '捕获 '+new Date(s.capture_ts*1000).toLocaleTimeString()+
+      ' ｜ 绕相机Y轴偏角 '+p.yaw_correction_deg.toFixed(2)+'°'+
+      ' ｜ '+(p.needs_turn?'向'+p.direction+'转 '+Math.abs(p.yaw_correction_deg).toFixed(2)+'°':'在 '+p.tolerance_deg+'° 容差内')+
+      ' ｜ 相机X/Z平面法线 ('+p.normal_camera[0].toFixed(3)+', '+p.normal_camera[2].toFixed(3)+')'+
+      ' ｜ 云台Yaw '+p.gimbal_yaw_deg.toFixed(2)+'°' : '尚无可执行的初始Pose';
+  }catch(e){}
+}
+async function initialAction(action){
+  if(initialBusy)return;
+  initialBusy=true;
+  document.getElementById('b_initial_gimbal').disabled=true;
+  document.getElementById('b_initial_capture').disabled=true;
+  document.getElementById('b_initial_execute').disabled=true;
+  const result=document.getElementById('initial_result');
+  result.textContent=action==='gimbal_init'?'正在初始化云台到 0° / 0° / 0°…':(action==='capture'?'正在捕获初始Pose…':'正在执行水平转向…');
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),60000);
+  try{
+    const r=await fetch('/qr_nav2/initial/'+action,{signal:controller.signal});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const text=await r.text();
+    result.textContent=text;
+    log('模块1: '+text,text.includes('✗')?'err':'ok');
+  }catch(e){result.textContent=e.name==='AbortError'?'请求超时，请检查终端执行状态后重新捕获':'请求失败: '+e.message;}
+  finally{clearTimeout(timer);initialBusy=false;document.getElementById('b_initial_capture').disabled=false;await pollInitial();pollPhase();}
+}
+pollInitial();
+setInterval(pollInitial,800);
 
 var callBusy = false;
 async function call(path){
@@ -930,6 +978,46 @@ def _register_qr_nav_routes(app):
             mimetype="text/html; charset=utf-8")
 
     # ── V2 路由 (核心) ──
+
+    @app.route('/qr_nav2/initial/state')
+    def _qrnav2_initial_state():
+        return Response(json.dumps(_initial_localization.state(), ensure_ascii=False),
+                        mimetype='application/json; charset=utf-8')
+
+    @app.route('/qr_nav2/initial/capture')
+    def _qrnav2_initial_capture():
+        if _is_af_running() or not _qrnav_poll_busy.acquire(blocking=False):
+            return Response('⏳ 导航或捕获正在执行，请稍后再试', mimetype='text/plain; charset=utf-8')
+        try:
+            return Response(_initial_localization.capture(), mimetype='text/plain; charset=utf-8')
+        finally:
+            _qrnav_poll_busy.release()
+
+    @app.route('/qr_nav2/initial/gimbal_init')
+    def _qrnav2_initial_gimbal_init():
+        if _is_af_running() or not _qrnav_poll_busy.acquire(blocking=False):
+            return Response('⏳ 导航或捕获正在执行，请稍后再试', mimetype='text/plain; charset=utf-8')
+        try:
+            return Response(_initial_localization.initialize_gimbal(), mimetype='text/plain; charset=utf-8')
+        finally:
+            _qrnav_poll_busy.release()
+
+    @app.route('/qr_nav2/initial/execute')
+    def _qrnav2_initial_execute():
+        if _is_af_running() or not _qrnav_poll_busy.acquire(blocking=False):
+            return Response('⏳ 导航或捕获正在执行，请稍后再试', mimetype='text/plain; charset=utf-8')
+        dog_lock = getattr(_gpea, '_http_dog_busy', None)
+        acquired = False
+        try:
+            if dog_lock is not None:
+                acquired = dog_lock.acquire(blocking=False)
+                if not acquired:
+                    return Response('⏳ 机器狗控制正在执行', mimetype='text/plain; charset=utf-8')
+            return Response(_initial_localization.execute(), mimetype='text/plain; charset=utf-8')
+        finally:
+            if acquired:
+                dog_lock.release()
+            _qrnav_poll_busy.release()
 
     @app.route("/qr_nav2")
     def _qrnav2_page():

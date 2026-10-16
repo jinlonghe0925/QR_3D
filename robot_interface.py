@@ -20,8 +20,9 @@
 
 import socket
 import struct
+import threading
 import math
-from time import sleep
+from time import sleep, monotonic
 
 # ======================= 配置（按需修改） =======================
 ROBOT_IP   = '192.168.1.103'
@@ -48,16 +49,17 @@ HEARTBEAT_HZ  = 5.0      # 流内附带心跳频率 (0=不发; 5.0=每 200ms 1 �
 _HEARTBEAT    = 0x21040001
 _STAND_UP     = 0x21010202   # 起立 (已验证)
 _MANUAL_MODE  = 0x21010C02   # 手动模式
-_FORCE_CONTROL = 0x21010205  # ★力控 (实体遥控器同名按钮, 移动前必发使能)
-_START_MOTION = 0x21010201   # 备用使能 (若 FORCE_CONTROL 无效可换此码)
-_GAIT_DEFAULT = 0x21010300   # 默认 gait (可能是「踏步」原地不动; 走路用 0x21010301/0x21010302 试)
-_GAIT_TROT    = 0x21010301   # 备选 gait: 小跑/行走 (原 0x21010300 踏步时换此)
+_FORCE_CONTROL = 0x3101020A  # 本机日志1659行：Slam switch force control；不是0x21010205(jump long2)
+_START_MOTION = 0x21010201   # 本机日志：GamePad start/stop action，属于切换按键
+_GAIT_DEFAULT = 0x21010300   # 本机日志：Received trot gait
+_GAIT_TROT    = 0x21010301   # 旧名兼容；本机日志实际为fly(run) trot，不是RLWalk
+_GAIT_RL_WALK = 0x21010420   # 本机日志305/393/404行：GamePad Received RLWalk
 _GAIT_RUN     = 0x21010302   # 备选 gait: 奔跑
 _AXIS_LY = 0x21010130   # 前进/后退 (虚拟摇杆 LY; 需 20Hz 流式)
 _AXIS_LX = 0x21010131   # 左移/右移 (虚拟摇杆 LX)
 _AXIS_RX = 0x21010135   # 左转/右转 (虚拟摇杆 RX)
 _LIE_DOWN = 0x21010203  # 趴下复位 (已验证)
-_DAMP     = 0x21010204  # 阻尼模式 (软趴, 备选)
+_DAMP     = None        # 本机0x21010204是dance；未确认阻尼码，不能使用该值
 
 
 def _u32(v):
@@ -71,6 +73,71 @@ class Dog:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._addr = (ip, port)
         self._ready = False     # 是否已起立且「开始运动」已使能
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread = None
+        self._remote_axes_deadline = None
+        self._stand_requested = False
+        self._force_requested = False
+        self._motion_requested = False
+        self._gait = None
+        self._down_requested = False
+
+    def record_remote_mode(self, action):
+        """记录已发指令以衔接页面2；不拦截页面1按键，不代表硬件反馈。"""
+        if action == 'stand':
+            self._down_requested = False
+            self._stand_requested = True
+            self._force_requested = self._motion_requested = self._ready = False
+            self._gait = None
+        elif action == 'force':
+            self._force_requested = self._ready = True
+            self._motion_requested = False
+            self._gait = None
+        elif action == 'motion':
+            self._motion_requested = not self._motion_requested
+        elif action in ('gait0', 'gait1', 'rlwalk'):
+            self._gait = {'gait0': _GAIT_DEFAULT, 'gait1': _GAIT_TROT,
+                          'rlwalk': _GAIT_RL_WALK}[action]
+
+    def prepare_rl_walk(self):
+        """自动横移复用页面1的模式记录，避免重复起立或启停。"""
+        if not self._stand_requested:
+            self.stand_quiet()
+        elif not self._force_requested:
+            self.force_control()
+        if not self._motion_requested:
+            self.start_motion(gait=_GAIT_RL_WALK)
+        if self._gait != _GAIT_RL_WALK:
+            self.set_gait(_GAIT_RL_WALK)
+        return _GAIT_RL_WALK
+
+    def remote_axes_sent(self, values):
+        """网页需持续刷新摇杆；失联时归零，心跳不能让最后一帧一直保持。"""
+        self._remote_axes_deadline = monotonic() + 0.5 if any(values) else None
+
+    def _check_remote_axes_timeout(self):
+        if self._remote_axes_deadline is not None and monotonic() >= self._remote_axes_deadline:
+            self._remote_axes_deadline = None
+            print('[Dog] 网页摇杆超过0.5秒未刷新，发送零速')
+            self.stop_move()
+
+    def _start_heartbeat(self):
+        """模式切换和等待期间也保活；本机日志可见 No wifi for +1s。"""
+        if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
+            return
+        self._heartbeat_stop.clear()
+
+        def loop():
+            while not self._heartbeat_stop.wait(0.1):
+                try:
+                    self._send(_HEARTBEAT, 0)
+                    self._check_remote_axes_timeout()
+                except OSError as exc:
+                    print(f'[Dog] 心跳发送中断: {exc}')
+                    break
+
+        self._heartbeat_thread = threading.Thread(target=loop, daemon=True, name='dog-heartbeat')
+        self._heartbeat_thread.start()
 
     def _send(self, code, value, debug=False):
         try:
@@ -98,14 +165,17 @@ class Dog:
           - 缺「开始运动」→ 狗完全不踏步 (腿不动)
           - 两者齐全 → 狗原地踏步; 切对 gait 后才能前进
         """
+        self._start_heartbeat()
         self._send(_HEARTBEAT, 0, debug=True)                     # 先"注册"客户端
-        self._send(_STAND_UP, 0, debug=True);     sleep(1.5)
+        self._send(_STAND_UP, 0, debug=True);     sleep(3.0)
         self._send(_MANUAL_MODE, 0, debug=True);   sleep(0.5)
-        self._send(_FORCE_CONTROL, 0, debug=True); sleep(0.5)
+        self._send(_FORCE_CONTROL, 0, debug=True); sleep(1.2)
         self._send(_START_MOTION, 0, debug=True);  sleep(0.5)
         self._send(gait, 0, debug=True);           sleep(0.5)
         self._ready = True
         self._gait = gait
+        self._stand_requested = self._force_requested = self._motion_requested = True
+        self._down_requested = False
 
     def force_control(self):
         """「力控」使能 (对应遥控器上的「力控」按钮)。阻塞约 1 秒
@@ -113,9 +183,11 @@ class Dog:
         第二步 (在 start_motion 之前必须先发), 让腿进入柔性模式。
         缺它: 移动指令被运控丢弃。
         """
+        self._start_heartbeat()
         self._send(_MANUAL_MODE, 0, debug=True);   sleep(0.3)
-        self._send(_FORCE_CONTROL, 0, debug=True); sleep(0.4)
+        self._send(_FORCE_CONTROL, 0, debug=True); sleep(1.2)
         self._ready = True
+        self.record_remote_mode('force')
 
     def stand_quiet(self):
         """「静默起立」: 起立+手动+力控, 但**不发** 开始运动+gait (腿保持静止)
@@ -124,44 +196,33 @@ class Dog:
         (踏步会让身体微抖, 拍出来的图像模糊 / 位姿抖动)。
         之后调用 start_motion() + set_gait(行走) 才会让狗真的能移动。
         """
+        self._start_heartbeat()
         self._send(_HEARTBEAT, 0, debug=True)                     # 先"注册"客户端
-        self._send(_STAND_UP, 0, debug=True);     sleep(1.5)
+        self._send(_STAND_UP, 0, debug=True);     sleep(3.0)
         self._send(_MANUAL_MODE, 0, debug=True);   sleep(0.5)
-        self._send(_FORCE_CONTROL, 0, debug=True); sleep(0.5)
+        self._send(_FORCE_CONTROL, 0, debug=True); sleep(1.2)
         # ★ 不发 START_MOTION 也不发 gait → 狗站着腿不动
         self._ready = True
         self._gait = None  # 标记未发 gait, 后续需主动调 start_motion + set_gait
+        self._stand_requested = self._force_requested = True
+        self._motion_requested = False
+        self._down_requested = False
 
-    def start_motion(self):
-        """「开始运动」使能 (对应遥控器上的同名按钮)。阻塞约 1 秒
-
-        第三步 (在 force_control 之后发), 启动腿部步态循环。
-        缺它: 狗完全不踏步; 两者齐全后狗才会「原地踏步」,
-        此时再切对 gait 才能前进。
-
-        ★ Bug 修复: 补发 MANUAL_MODE + FORCE_CONTROL + HEARTBEAT
-          因为 stand_quiet 后 _ready=True, 但有些运控版本会"忘记"
-          之前的力控状态, 在收到 AXIS 指令时仍当作"未力控"拒收。
-          显式重发确保 100% 生效。
-        """
+    def start_motion(self, gait=None):
+        """发送启停切换及所选步态；不重发手动/力控打断当前模式。"""
+        self._start_heartbeat()
         self._send(_HEARTBEAT, 0, debug=True)
-        self._send(_MANUAL_MODE, 0, debug=True);   sleep(0.2)
-        self._send(_FORCE_CONTROL, 0, debug=True); sleep(0.3)
         self._send(_START_MOTION, 0, debug=True);  sleep(0.5)
-        gait = getattr(self, '_gait', _GAIT_DEFAULT)
+        self.record_remote_mode('motion')
         if gait is None:
-            gait = _GAIT_DEFAULT
+            gait = self._gait if self._gait is not None else _GAIT_DEFAULT
         self._send(gait, 0, debug=True);           sleep(0.3)
         self._ready = True
         self._gait = gait
 
     def set_gait(self, gait=_GAIT_DEFAULT):
-        """切换步态 (解决「原地踏步不前进」)。
-
-        备选码:
-          0x21010300  踏步 (默认, 原地腿动 body 不前进)
-          0x21010301  小跑/行走 (body 平移)
-          0x21010302  奔跑
+        """发送步态。日志确认：0x21010300=trot，0x21010301=fly(run) trot，
+        0x21010420=RLWalk。发包成功不代表切换完成。
         """
         self._send(gait, 0, debug=True)
         sleep(0.3)
@@ -229,6 +290,7 @@ class Dog:
             stop_after: 结束后是否补发零速帧 (松手)
             hb_hz:    流内附带心跳频率 (0=不发)
         """
+        self._remote_axes_deadline = None  # 自动定时移动不使用网页摇杆刷新期限。
         hz = max(1.0, float(hz))
         period = 1.0 / hz
         duration = float(duration)
@@ -282,14 +344,24 @@ class Dog:
                 sleep(period)
 
     def stand_down(self):
-        """趴下复位 (站立 → 卧姿)。阻塞约 2 秒"""
+        """零速→请求退出运动/RL至力控→等待→趴下，不重复发送启停切换。"""
+        self._start_heartbeat()
+        self.remote_axes_sent((0, 0, 0))
         self.stop_move()
-        self._send(_LIE_DOWN, 0)
+        print('[Dog] 趴下流程: 先切回力控，等待4秒退出运动/RL')
+        self._send(_FORCE_CONTROL, 0, debug=True)
+        sleep(4.0)
+        self._send(_LIE_DOWN, 0, debug=True)
         self._ready = False
+        self._stand_requested = self._force_requested = self._motion_requested = False
+        self._gait = None
         sleep(2.0)
+        self._down_requested = True
 
     def damp(self):
         """阻尼模式 (关节软掉, 可直接搬动)。阻塞约 1 秒"""
+        if _DAMP is None:
+            raise RuntimeError('本机阻尼指令未确认；0x21010204实际为舞蹈，已取消发送')
         self.stop_move()
         self._send(_DAMP, 0)
         self._ready = False
@@ -302,7 +374,10 @@ class Dog:
             stand_down: True=先趴下复位再断开 (默认); False=只停运动
         """
         self.stop_move()
-        if stand_down:
+        if stand_down and not self._down_requested:
             self.stand_down()
+        self._heartbeat_stop.set()
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join(timeout=1.0)
         self._ready = False
         self._sock.close()

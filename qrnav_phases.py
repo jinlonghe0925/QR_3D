@@ -104,7 +104,7 @@ def _phase_reset():
 
 
 # ── 统一的『多帧采集』底层 (两次捕获都调这个) ──
-def _do_capture_once(phase_name):
+def _do_capture_once(phase_name, *, align_gimbal=True):
     """两次捕获的底层算法 (完全相同): 触发多帧采集 + 同步结果到全局 pose_box
 
     Returns:
@@ -126,7 +126,7 @@ def _do_capture_once(phase_name):
         history = getattr(est, "_pose_history", None)
         if history is not None:
             history.clear()
-        est._start_estimate_async(frame)
+        est._start_estimate_async(frame, align_gimbal=align_gimbal)
     except Exception as e:
         return False, None, f"✗ 触发失败: {e}", ""
     time.sleep(0.3)

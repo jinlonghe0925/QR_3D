@@ -79,15 +79,14 @@ def main(argv=None):
     _qrnav_estimator_holder[0] = estimator
     _gpea._http_dog_provider = estimator._handle_dog_action
 
-    print("\n[DOG] 创建实例并静默起立 ...", flush=True)
+    print("\n[DOG] 创建控制实例 ...", flush=True)
     try:
         dog = estimator._get_dog()
         print(f"  ✓ dog={getattr(dog, '_addr', '?')}", flush=True)
-        dog.stand_quiet()
-        print("  ✓ 静默起立完成，可捕获 QR；执行横移会自动开始并在到位后停止", flush=True)
+        print("  ✓ 页面1使用独立遥控按键；启动程序不发送起立/运动指令", flush=True)
     except Exception as exc:
         # 狗离线不能阻止相机和网页启动，页面仍可用于诊断并手动重试。
-        print(f"  ⚠ 静默起立失败: {exc}", flush=True)
+        print(f"  ⚠ 创建控制实例失败: {exc}", flush=True)
 
     print("\n[HTTP] 启动合并服务器 ...", flush=True)
     try:

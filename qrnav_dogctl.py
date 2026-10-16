@@ -83,31 +83,16 @@ def _move_lateral_steps(lat, max_step=None):
             return (direction, 0.0, 0, 0.0, f"✗ 创建 dog 实例失败: {e}")
 
     head = []
-    if not getattr(dog, "ready", False):
-        try:
-            print("[V2.move] 狗未就绪, 自动静默起立 ...")
-            dog.stand_quiet()
-            head.append("✓ 自动静默起立+力控")
-        except Exception as e:
-            return (direction, 0.0, 0, 0.0,
-                    f"✗ 横移中止: 静默起立失败: {e}")
-
-    # 每次执行都明确重发完整运动使能。_gait 只是本地缓存，不能证明机器狗
-    # 当前仍处于运动状态；上一版按 _gait 跳过 start_motion 会出现按钮执行了
-    # 但机器狗不动。切换 gait 后留出稳定时间，等价于原来手动点两个按钮的间隔。
-    walk_gait = 0x21010301
-    settle_s = float(cfg.get("DOG_MOTION_SETTLE_S", 1.0) or 0.0)
-    if settle_s < 0.0:
-        settle_s = 0.0
+    # 日志393..401：RLWalk从接收到kRunPolicy约3.1s；等待期间Dog心跳持续运行。
+    settle_s = max(4.0, float(cfg.get("DOG_MOTION_SETTLE_S", 4.0) or 0.0))
     try:
-        print("[V2.move] 执行横移自动使能: 力控 → 开始运动 → 行走 gait")
-        dog.start_motion()
-        dog.set_gait(walk_gait)
+        print("[V2.move] 执行横移: 复用页面1模式 → RLWalk → 等待切换完成")
+        walk_gait = dog.prepare_rl_walk()
         if settle_s > 0.0:
             print(f"[V2.move] 等待运控状态稳定 {settle_s:.1f}s，再发送横移")
             time.sleep(settle_s)
         head.append(
-            f"✓ 已重发力控+开始运动+行走 gait，稳定等待 {settle_s:.1f}s")
+            f"✓ 共用RLWalk指令0x{walk_gait:08X}，稳定等待 {settle_s:.1f}s")
     except Exception as e:
         return (direction, 0.0, 0, 0.0,
                 f"✗ 横移中止: 开始运动/行走 gait 准备失败: {e}")
@@ -166,7 +151,7 @@ def _move_lateral_steps(lat, max_step=None):
     # 安全锁拒绝及移动中途异常，保证按钮返回前机器狗已经收到零速命令。
     try:
         dog.stop_move()
-        move_rets.append("✓ 已到目标距离并停止运动（LY/LX/RX 零速帧）")
+        move_rets.append("✓ 已完成计划横移并发送零速（非实测里程到位反馈）")
     except Exception as e:
         move_rets.append(f"✗ 停止运动失败: {e}")
 
@@ -199,23 +184,10 @@ def _init_dog_3steps():
         return (f"⏳ 冷却中 (距上次初始化 {elapsed:.1f}s < "
                 f"{_QR_NAV_INIT_COOLDOWN:.1f}s), 请稍候再按")
     _qrnav_last_init_ts[0] = now
-    msgs = []
-    # ① 起立 (心跳+起立+手动+力控+开始运动+gait, 约 3.5s)
+    # stand入口统一调用prepare_rl_walk，已包含所需的起立/力控/启停/RLWalk。
+    # 不能再追加force和motion：会中断RL或再次切换启停。
     r = _call_dog_http("stand", value=0.0)
-    msgs.append(f"① 起立: {r}")
-    if _dog_msg_bad(r):
-        return " | ".join(msgs)
-    # ② 力控 (缺它 → 移动指令被运控丢弃)
-    r = _call_dog_http("force", value=0.0)
-    msgs.append(f"② 力控: {r}")
-    if _dog_msg_bad(r):
-        return " | ".join(msgs)
-    # ③ 开始运动 + gait 0x21010301 (缺它 → 狗腿不动 / 原地踏步不前进)
-    r = _call_dog_http("motion", value=0.0, gait=0x21010301)
-    msgs.append(f"③ 开始运动: {r}")
-    if _dog_msg_bad(r):
-        return " | ".join(msgs)
-    return " | ".join(msgs) + " ✓ 三步完成, 狗应原地踏步"
+    return r
 
 
 def _get_dog_step_state():
@@ -229,10 +201,10 @@ def _get_dog_step_state():
     state = {"stand": False, "force": False, "motion": False, "ready": False}
     dog = _get_dog_obj()
     if dog is not None:
-        if bool(getattr(dog, "ready", False)):
-            state["stand"] = state["force"] = True
-            state["motion"] = getattr(dog, "_gait", None) is not None
-            state["ready"] = state["motion"]
+        state["stand"] = bool(getattr(dog, '_stand_requested', False))
+        state["force"] = bool(getattr(dog, '_force_requested', False))
+        state["motion"] = bool(getattr(dog, '_motion_requested', False))
+        state["ready"] = (state["motion"] and getattr(dog, '_gait', None) == 0x21010420)
         return state
     try:
         import urllib.request
@@ -254,7 +226,7 @@ def _get_dog_step_state():
 
 def _is_dog_fully_ready():
     try:
-        return _get_dog_step_state().get("motion", False)
+        return _get_dog_step_state().get("ready", False)
     except Exception:
         return False
 

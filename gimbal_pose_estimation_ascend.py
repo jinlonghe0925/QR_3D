@@ -269,13 +269,28 @@ def _make_flask_app(owner=None):
         <h3 style="color:#f0a;text-align:center">🐕 机器狗控制 (UDP)</h3>
         <div style="text-align:center;margin-bottom:12px">
         <div style="color:#888;font-size:12px;margin-bottom:6px">
-          顺序: ① 起立 → ② 力控 → ③ 开始运动 → ④ 单步移动 (每按一次 = 一步)</div>
-        <button class="btn-dog" onclick="dog('stand')">① 🦿 起立连接</button>
-        <button class="btn-dog" onclick="dog('force')">② 🖐️ 力控</button>
-        <button class="btn-dog" onclick="dog('motion')">③ 🚀 开始运动</button>
-        <button class="btn-dog" onclick="dog('down')">🐾 趴下复位</button>
-        <button class="btn-dog" onclick="dog('damp')">💧 阻尼</button>
-        <button class="btn-dogq" onclick="dog('stop')">⏹ 停止并趴下</button>
+          遥控模式：手动模式 → 起立 → 力控 → 开始运动；方向按住走，松开归零。再次按启停切换运动状态。</div>
+        <button class="btn-dog" onclick="remoteMode('manual')">手动模式</button>
+        <button class="btn-dog" onclick="remoteMode('stand')">① 起立按键</button>
+        <button class="btn-dog" onclick="remoteMode('force')">② 力控</button>
+        <button class="btn-dog" onclick="remoteMode('motion')">③ 开始/停止运动</button>
+        <button class="btn-dog" onclick="remoteMode('gait0')">步态 0</button>
+        <button class="btn-dog" onclick="remoteMode('gait1')">行走步态 1</button>
+        <button class="btn-dog" onclick="remoteMode('rlwalk')">RL 行走</button>
+        <button class="btn-dog" onclick="remoteMode('down')">趴下</button>
+        <button class="btn-dog" disabled title="旧指令在本机是舞蹈，阻尼码待确认">阻尼（待确认）</button>
+        <button class="btn-dogq" onclick="remoteMode('disconnect')">断开（不趴下）</button>
+        <div id="remote_pad" style="touch-action:none;user-select:none;margin:10px">
+          <button class="btn-dog" data-axis="1,0,0">⬆ 按住前进</button><br>
+          <button class="btn-dog" data-axis="0,1,0">⬅ 按住左移</button>
+          <button class="btn-dogq" onclick="remoteHeld=null;remoteSend('release')">松手归零</button>
+          <button class="btn-dog" data-axis="0,-1,0">➡ 按住右移</button><br>
+          <button class="btn-dog" data-axis="-1,0,0">⬇ 按住后退</button><br>
+          <button class="btn-dog" data-axis="0,0,-1">↺ 按住左转</button>
+          <button class="btn-dog" data-axis="0,0,1">↻ 按住右转</button><br>
+          摇杆幅度 <select id="remote_amp"><option value="0.3">慢 30%</option><option value="0.6" selected>中 60%</option><option value="1">满幅</option></select>
+        </div>
+        <details><summary>固定距离单步（独立于遥控）</summary>
         <br>
         <button class="btn-dog" onclick="dogstep(-1)">− 步长</button>
         <span id="dog_step" style="color:#0cf;font-size:14px;margin:0 6px">0.2m / 15°</span>
@@ -288,9 +303,10 @@ def _make_flask_app(owner=None):
         <button class="btn-dogm" onclick="dog('right')">➡ 右移</button>
         <button class="btn-dogm" onclick="dog('tl')">↺ 左转</button>
         <button class="btn-dogm" onclick="dog('tr')">↻ 右转</button>
+        </details>
         <div class="msg" id="dog_msg">机器狗未连接: 先「① 起立」→「② 力控」→「③ 开始运动」</div>
         <div style="color:#888;font-size:11px;margin-top:4px">
-          ⚠ 「② 力控 + ③ 开始运动」即实体遥控器上的同名两个按钮, 缺一腿不动</div>
+          遥控按键独立发送。起立后等3秒、力控后等2秒，再开始运动；选择RL行走后等4秒再移动。步态1是跑步小跑，RL行走使用本机日志确认的0x21010420。</div>
         </div>
         <div class="status" id="status"></div>
         <script>
@@ -302,6 +318,59 @@ def _make_flask_app(owner=None):
         var DOG_LOCK_M=0.3, DOG_LOCK_DEG=30;
         var dogStepM=0.2, dogStepDeg=15;
         var dogBusy=false;
+        var remoteQueue=Promise.resolve(), remoteHeld=null, remoteArmed=false, remotePending=false;
+        function remoteRequest(action,query){
+          return fetch('/dog/remote_'+action+(query||''),{keepalive:true}).then(function(r){
+            if(!r.ok)throw new Error('HTTP '+r.status);
+            return r.text();
+          }).then(function(t){document.getElementById('dog_msg').innerText=t;return t;});
+        }
+        function remoteSend(action,query){
+          remoteQueue=remoteQueue.then(function(){return remoteRequest(action,query);}).catch(function(e){
+            document.getElementById('dog_msg').innerText='遥控请求失败: '+e.message;
+          });
+          return remoteQueue;
+        }
+        function remoteRelease(){
+          if(!remoteHeld)return remoteQueue;
+          remoteHeld=null;
+          return remoteSend('release');
+        }
+        function remoteMode(action){
+          remoteRelease();
+          remoteArmed=action!=='disconnect';
+          return remoteSend(action);
+        }
+        function remoteTick(){
+          if(!remoteHeld||remotePending)return;
+          remotePending=true;
+          var v=remoteHeld, amp=Number(document.getElementById('remote_amp').value);
+          remoteSend('axes','?vx='+v[0]*amp+'&vy='+v[1]*amp+'&vz='+v[2]*amp)
+            .then(function(){remotePending=false;});
+        }
+        document.querySelectorAll('[data-axis]').forEach(function(b){
+          b.addEventListener('pointerdown',function(e){
+            e.preventDefault();
+            if(remoteHeld)return;
+            b.setPointerCapture(e.pointerId);
+            remoteArmed=true;
+            remoteHeld=b.getAttribute('data-axis').split(',').map(Number);
+            remoteTick();
+          });
+          b.addEventListener('lostpointercapture',remoteRelease);
+        });
+        window.addEventListener('pointerup',remoteRelease);
+        window.addEventListener('pointercancel',remoteRelease);
+        window.addEventListener('blur',remoteRelease);
+        window.addEventListener('pagehide',remoteRelease);
+        document.addEventListener('visibilitychange',function(){if(document.hidden)remoteRelease();});
+        setInterval(remoteTick,50);
+        setInterval(function(){
+          if(remoteArmed&&!remoteHeld&&!remotePending){
+            remotePending=true;
+            remoteSend('heartbeat').then(function(){remotePending=false;});
+          }
+        },100);
         function dog(a){
           if(dogBusy)return;                       // 上一步未完成, 忽略本次点击
           var v=(a=='tl'||a=='tr')?dogStepDeg:(a=='stand'||a=='force'||a=='motion'||a=='start'||a=='stop'||a=='down'||a=='damp')?0:dogStepM;
@@ -487,7 +556,12 @@ def _make_flask_app(owner=None):
             with _http_dog_lock:
                 _http_dog_msg = f"⏳ 执行中: {action} ..."
             if _http_dog_provider:
-                msg = _http_dog_provider(action, value, gait=gc)
+                if action == 'remote_axes':
+                    axes = tuple(request.args.get(k, default=0.0, type=float)
+                                 for k in ('vx', 'vy', 'vz'))
+                    msg = _http_dog_provider(action, value, gait=gc, stick=axes)
+                else:
+                    msg = _http_dog_provider(action, value, gait=gc)
             else:
                 msg = "机器狗未连接"
         except Exception as e:
@@ -1951,7 +2025,7 @@ class GimbalPoseEstimator:
             print(f"[狗] 实例已创建: {ip}")
         return self._dog
 
-    def _handle_dog_action(self, action, value=0.0, gait=None):
+    def _handle_dog_action(self, action, value=0.0, gait=None, stick=None):
         """网页机器狗控制入口
 
         action: stand=起立连接 (心跳+起立+手动+力控+开始运动+gait)
@@ -1971,10 +2045,55 @@ class GimbalPoseEstimator:
         v = float(value or 0.0)
         try:
             dog = self._get_dog()
+            if act.startswith('remote_'):
+                from robot_interface import _FORCE_CONTROL, _GAIT_RL_WALK
+                dog._start_heartbeat()
+                # 页面1遥控入口：一个模式按键只发一个对应指令，无初始化链。
+                codes = {'remote_manual': 0x21010C02, 'remote_stand': 0x21010202,
+                         'remote_force': _FORCE_CONTROL, 'remote_motion': 0x21010201,
+                         'remote_gait0': 0x21010300, 'remote_gait1': 0x21010301,
+                         'remote_rlwalk': _GAIT_RL_WALK, 'remote_heartbeat': 0x21040001}
+                if act in codes:
+                    dog._send(codes[act], 0, debug=act != 'remote_heartbeat')
+                    dog.record_remote_mode(act[7:])
+                    return f'已发送遥控按键 {act[7:]} (0x{codes[act]:08X})'
+                if act == 'remote_axes':
+                    axes = tuple(float(x) for x in (stick or (0, 0, 0)))
+                    if len(axes) != 3 or not all(math.isfinite(x) for x in axes):
+                        return '✗ 摇杆轴值必须是三个有限数'
+                    values = tuple(int(max(-1.0, min(1.0, x)) * 32767) for x in axes)
+                    for code, value in zip((0x21010130, 0x21010131, 0x21010135), values):
+                        dog._send(code, value)
+                    dog._send(0x21040001, 0)
+                    dog.remote_axes_sent(values)
+                    count = getattr(self, '_remote_axis_count', 0) + 1
+                    self._remote_axis_count = count
+                    if count == 1 or count % 20 == 0:
+                        print(f'[遥控] 已发送 {count} 组轴指令，target={dog._addr}，'
+                              f'LY/LX/RX={values}；未获运控执行确认')
+                    return f'已发送遥控摇杆轴指令，累计 {count} 组（非实测运动状态）'
+                if act == 'remote_release':
+                    dog.remote_axes_sent((0, 0, 0))
+                    dog.stop_move()
+                    print(f"[遥控] 松手归零，此次共发送 {getattr(self, '_remote_axis_count', 0)} 组轴指令")
+                    self._remote_axis_count = 0
+                    return '已发送摇杆零速，保持当前模式'
+                if act == 'remote_down':
+                    dog.stand_down()
+                    return '已发送趴下指令'
+                if act == 'remote_damp':
+                    dog.damp()
+                    return '已发送阻尼指令'
+                if act == 'remote_disconnect':
+                    dog.close(stand_down=False)
+                    self._dog = None
+                    self._remote_axis_count = 0
+                    return '已归零并断开，未发送趴下'
+                return f'未知遥控动作: {act}'
             if act in ('stand', 'init', 'connect'):
-                dog.init()                      # 起立→手动→力控→步态 (约3s)
-                print("[狗] 起立+力控完成, 运动就绪")
-                return f"✓ 已起立并力控 ({getattr(self, '_dog_ip', '')})"
+                dog.prepare_rl_walk()
+                time.sleep(4.0)
+                return '✓ 已完成运动准备并选择RL行走 (0x21010420)；实机状态以机器狗为准'
             if act in ('stand_quiet', 'quiet_stand', 'stand_no_motion'):
                 # ★ V2 专用: 静默起立 (起立+手动+力控, 不发开始运动+gait, 腿保持静止)
                 # 适合拍 QR / 拍照, 避免踏步导致图像抖动
@@ -1988,9 +2107,10 @@ class GimbalPoseEstimator:
             if act in ('motion', 'start', 'start_motion', 'enable'):
                 # 可选: 同时切步态 (解决原地踏步不前进), 由 route 把 ?gait= 解析后传入
                 _gc = gait
-                dog.start_motion()                # 单独补发「开始运动」(第③步, 启动步态循环)
                 if _gc:
-                    dog.set_gait(_gc)             # 顺便切行走 gait
+                    dog.start_motion(gait=_gc)
+                else:
+                    dog.start_motion()
                 print(f"[狗] 开始运动 (第③步), gait={_gc}")
                 msg = "✓ 已发送「开始运动」, 狗应原地踏步"
                 if _gc:
@@ -2483,7 +2603,7 @@ class GimbalPoseEstimator:
         finally:
             print("\n视频流已停止")
 
-    def _start_estimate_async(self, frame):
+    def _start_estimate_async(self, frame, *, align_gimbal=True):
         """把位姿估计投递到『常驻推理线程』执行 (不阻塞视频推流和按键处理)。
 
         为什么用常驻线程, 而不是每次 [c] 都新起一个线程:
@@ -2509,7 +2629,7 @@ class GimbalPoseEstimator:
 
         self._est_busy = True
         try:
-            self._inf_queue.put(frame.copy(), timeout=1.0)
+            self._inf_queue.put((frame.copy(), align_gimbal), timeout=1.0)
         except Exception as e:
             self._est_busy = False
             print(f"  ⚠ 位姿估计任务投递失败: {e}")
@@ -2533,7 +2653,8 @@ class GimbalPoseEstimator:
                 self._est_busy = False
                 break
             try:
-                self._capture_and_estimate(f)
+                frame, align_gimbal = f
+                self._capture_and_estimate(frame, align_gimbal=align_gimbal)
             except Exception as e:
                 print(f"✗ 位姿估计异常: {e}")
                 _set_panel_status(f"位姿估计失败: {e}")
@@ -2541,7 +2662,7 @@ class GimbalPoseEstimator:
                 self._pose_intrinsics_snapshot = None
                 self._est_busy = False
     
-    def _capture_and_estimate(self, frame):
+    def _capture_and_estimate(self, frame, *, align_gimbal=True):
         """多帧滑动窗口 + EMA 平滑位姿估计
 
         方案:
@@ -2880,7 +3001,8 @@ class GimbalPoseEstimator:
                     #     (与 QR_3D/gimbal_pose_estimation_ascend.py 一致)
                     with _http_aligned_lock:
                         _http_aligned_ver += 1
-                        _http_aligned_msg = "云台旋转对齐中, 请稍候 ..."
+                        _http_aligned_msg = ("云台旋转对齐中, 请稍候 ..." if align_gimbal
+                                             else "仅捕获位姿，保持云台角度不变")
 
                     aligned, amsg = frame, "未旋转 (无位姿数据)"
                     # [关键] 用『首帧原始位姿』做旋转, 而非 10 帧 EMA 平均
@@ -2888,7 +3010,9 @@ class GimbalPoseEstimator:
                     #   - 10 帧 EMA 平均会"吃掉"小幅偏差, 旋转量过小 → 二维码移不到位
                     #   - 与 QR_3D 源代码逻辑严格保持一致
                     pd_rotate = getattr(self, '_first_pose_data', None) or pd
-                    if pd_rotate is not None and self.gimbal is not None:
+                    if not align_gimbal:
+                        amsg = "仅捕获位姿，保持云台角度不变"
+                    if align_gimbal and pd_rotate is not None and self.gimbal is not None:
                         try:
                             # ── QR_3D 增量式对齐 (与 pose_pipeline.compute_gimbal_target 一致) ──
                             #   不直接用 PnP 的 pitch/roll 当绝对目标 (避免 roll-180 又叠加 gimbal_pitch
